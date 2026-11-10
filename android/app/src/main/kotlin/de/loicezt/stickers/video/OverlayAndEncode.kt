@@ -67,9 +67,11 @@ class OverlayAndEncode {
             return
         }
 
+        // Set synchronously: Flutter subscribes right after start() returns and would otherwise
+        // replay the previous run's SUCCESS/FAILED, reading the output file before it exists.
+        _status.value = State.RUNNING
+        _progress.value = ProgressState()
         encodeJob = scope.launch {
-            _status.value = State.RUNNING
-            _progress.value = ProgressState()
             try {
                 // MODIFIED: Pass maxFps to the encoding function
                 val webpData = doOverlayAndEncode(videoFile, overlayFile, config, maxFps)
