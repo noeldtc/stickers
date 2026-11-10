@@ -52,6 +52,7 @@ class OverlayAndEncode {
         private const val LOG_TAG = "OverlayAndEncode"
         private const val OUTPUT_DIMENSION = 512
         private const val MAX_CONSECUTIVE_TIMEOUTS = 3
+        private const val MAX_DURATION_MS = 10_000
     }
 
     /**
@@ -235,6 +236,8 @@ class OverlayAndEncode {
             var firstPtsUs = -1L
             var lastProcessedTimestampUs = -1L
             val frameIntervalUs = 1_000_000L / targetFrameRate
+            // The last frame stays visible for one frame interval.
+            val lastFrameDurationMs = max(1, (1000.0 / targetFrameRate).roundToInt())
 
             while (!isDecoderOutputDone && currentCoroutineContext().isActive) {
                 if (!isInputDone) {
@@ -271,6 +274,15 @@ class OverlayAndEncode {
                             processThisFrame = false // Drop frame
                         } else {
                             lastProcessedTimestampUs = currentTimestampUs
+                        }
+                    }
+                    // WhatsApp rejects animated stickers longer than 10 s: stop once the next frame
+                    // (plus the last frame's own duration) would exceed that.
+                    if (processThisFrame && firstPtsUs >= 0) {
+                        val nextMs = (decoderBufferInfo.presentationTimeUs - firstPtsUs + 500) / 1000
+                        if (nextMs + lastFrameDurationMs > MAX_DURATION_MS) {
+                            processThisFrame = false
+                            isDecoderOutputDone = true
                         }
                     }
 
@@ -314,8 +326,6 @@ class OverlayAndEncode {
             }
             if (currentFrame == 0) throw IllegalStateException("No frames were encoded")
 
-            // The last frame stays visible for one frame interval.
-            val lastFrameDurationMs = max(1, (1000.0 / targetFrameRate).roundToInt())
             val result = webpEncoder.nativeReleaseEncoder(
                 encoderHandle, lastTimestampMs + lastFrameDurationMs
             )

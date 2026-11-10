@@ -181,7 +181,9 @@ class CropAndScale(private val context: Context) {
                 endTimeUs
             }
             val effectiveStartTimeUs = max(0L, startTimeUs)
-            val effectiveEndTimeUs = min(endTimeUs, originalDurationUs)
+            // WhatsApp rejects animated stickers longer than 10 s.
+            val effectiveEndTimeUs =
+                min(min(endTimeUs, originalDurationUs), effectiveStartTimeUs + 10_000_000L)
             val trimmedDurationUs = effectiveEndTimeUs - effectiveStartTimeUs
             if (trimmedDurationUs <= 0) throw IllegalArgumentException("End time must be after start time.")
 
