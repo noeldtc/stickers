@@ -58,17 +58,24 @@ android {
         versionName flutterVersionName
     }
 
+    // Firma: en CI llega por SIGNING_* (variables de entorno); en local, por android/key.properties.
+    // Sin ninguna de las dos la release queda sin firmar (en vez de romper la configuración de Gradle).
+    def signingStoreFile = System.getenv("SIGNING_STORE_FILE") ?: keystoreProperties["storeFile"]
     signingConfigs {
-        create("release") {
-            keyAlias = keystoreProperties["keyAlias"]
-            keyPassword = keystoreProperties["keyPassword"]
-            storeFile = new File(keystoreProperties["storeFile"])
-            storePassword = keystoreProperties["storePassword"]
+        release {
+            if (signingStoreFile) {
+                storeFile = file(signingStoreFile)
+                storePassword = System.getenv("SIGNING_STORE_PASSWORD") ?: keystoreProperties["storePassword"]
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS") ?: keystoreProperties["keyAlias"]
+                keyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: keystoreProperties["keyPassword"]
+            }
         }
     }
     buildTypes {
         release {
-            signingConfig signingConfigs.release
+            if (signingStoreFile) {
+                signingConfig = signingConfigs.release
+            }
         }
     }
     externalNativeBuild {

@@ -1,1 +1,4 @@
 android/app/src/main/cpp/libwebp/** linguist-vendored
+
+*.sh text eol=lf
+Jenkinsfile text eol=lf

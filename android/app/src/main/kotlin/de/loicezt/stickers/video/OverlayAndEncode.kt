@@ -1,20 +1,19 @@
 package de.loicezt.stickers.video
 
-import android.graphics.Bitmap
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
-import android.os.Build
 import android.util.Log
-import androidx.annotation.RequiresApi
 import androidx.core.graphics.createBitmap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
@@ -22,10 +21,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeoutException
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
-
+/**
+ * Overlays a static WebP on every frame of a video and encodes the result as an animated
+ * WebP. Observe [status] and [progress] for updates.
+ */
 class OverlayAndEncode {
 
     enum class State {
@@ -39,6 +44,8 @@ class OverlayAndEncode {
     val progress = _progress.asStateFlow()
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    @Volatile
     private var encodeJob: Job? = null
 
     companion object {
@@ -50,25 +57,24 @@ class OverlayAndEncode {
     }
 
     /**
-     * Starts the video overlay and WebP encoding process.
-     * @param videoFile The source video file.
-     * @param overlayFile The static WebP image to overlay.
-     * @param outputFile The destination file for the animated WebP.
-     * @param config Configuration for the WebP encoder.
-     * @param maxFps The maximum frames per second for the output. If null, uses original FPS.
+     * Starts the overlay + WebP encode; non-blocking.
+     * @param maxFps The maximum frames per second of the output.
+     * @return false if an encode is already running (the request is ignored).
      */
-    // MODIFIED: Added maxFps parameter
+    @Synchronized
     fun start(
         videoFile: File,
         overlayFile: File,
         outputFile: File,
         config: WebPConfig,
         maxFps: Int
-    ) {
+    ): Boolean {
         if (_status.value == State.RUNNING) {
             Log.w(LOG_TAG, "Encoding is already in progress. Ignoring new request.")
-            return
+            return false
         }
+        _progress.value = ProgressState()
+        _status.value = State.RUNNING
 
         // Set synchronously: Flutter subscribes right after start() returns and would otherwise
         // replay the previous run's SUCCESS/FAILED, reading the output file before it exists.
@@ -76,27 +82,31 @@ class OverlayAndEncode {
         _progress.value = ProgressState()
         encodeJob = scope.launch {
             try {
-                // MODIFIED: Pass maxFps to the encoding function
                 val webpData = doOverlayAndEncode(videoFile, overlayFile, config, maxFps)
-                if (webpData != null) {
-                    outputFile.writeBytes(webpData)
-                    _status.value = State.SUCCESS
-                    Log.d(LOG_TAG, "Encoding finished successfully.")
-                } else {
-                    throw IllegalStateException("Encoding produced no data.")
+                    ?: throw IllegalStateException("Encoding produced no data.")
+                tempFile.writeBytes(webpData)
+                if (!tempFile.renameTo(outputFile)) {
+                    outputFile.delete()
+                    if (!tempFile.renameTo(outputFile)) {
+                        throw IllegalStateException("Could not move result to ${outputFile.path}")
+                    }
                 }
+                _progress.value = _progress.value.copy(
+                    progress = 1f, currentFrame = _progress.value.totalFrames
+                )
+                _status.value = State.SUCCESS
+                Log.d(LOG_TAG, "Encoding finished successfully.")
             } catch (e: CancellationException) {
+                tempFile.delete()
                 _status.value = State.CANCELLED
                 Log.d(LOG_TAG, "Encoding was cancelled.")
             } catch (e: Exception) {
+                tempFile.delete()
                 _status.value = State.FAILED
                 Log.e(LOG_TAG, "Encoding failed with an exception.", e)
-            } finally {
-                val finalState = _progress.value
-                _progress.value =
-                    finalState.copy(progress = 1f, currentFrame = finalState.totalFrames)
             }
         }
+        return true
     }
 
     fun cancel() {
@@ -107,7 +117,27 @@ class OverlayAndEncode {
         scope.cancel()
     }
 
+    /**
+     * Runs on a dedicated thread: the EGL context is bound to the thread that created it,
+     * so setup, drawing and teardown must all happen on the same one.
+     */
     private suspend fun doOverlayAndEncode(
+        videoFile: File,
+        overlayFile: File,
+        config: WebPConfig,
+        maxFps: Int
+    ): ByteArray? {
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            return withContext(executor.asCoroutineDispatcher()) {
+                encode(videoFile, overlayFile, config, maxFps)
+            }
+        } finally {
+            executor.shutdown()
+        }
+    }
+
+    private suspend fun encode(
         videoFile: File,
         overlayFile: File,
         config: WebPConfig,
@@ -117,43 +147,56 @@ class OverlayAndEncode {
         var decoder: MediaCodec? = null
         val glProcessor = OverlayGL()
         val webpEncoder = LibWebP()
-        var webpData: ByteArray? = null
-        var overlayBitmap: Bitmap? = null
+        var encoderHandle = 0L
 
-        return withContext(Dispatchers.IO) {
+        try {
+            // 1. Extractor setup
+            extractor.setDataSource(videoFile.absolutePath)
+            val videoTrackIndex = (0 until extractor.trackCount).indexOfFirst {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)
+                    ?.startsWith("video/") == true
+            }
+            if (videoTrackIndex == -1) throw IllegalStateException("No video track found")
+
+            val inputFormat = extractor.getTrackFormat(videoTrackIndex)
+            extractor.selectTrack(videoTrackIndex)
+
+            val videoWidth = inputFormat.getInteger(MediaFormat.KEY_WIDTH)
+            val videoHeight = inputFormat.getInteger(MediaFormat.KEY_HEIGHT)
+            val durationUs = if (inputFormat.containsKey(MediaFormat.KEY_DURATION)) {
+                inputFormat.getLong(MediaFormat.KEY_DURATION)
+            } else {
+                0L
+            }
+            val rotation = if (inputFormat.containsKey(MediaFormat.KEY_ROTATION)) {
+                inputFormat.getInteger(MediaFormat.KEY_ROTATION)
+            } else {
+                0
+            }
+
+            val originalFrameRate = if (inputFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                inputFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
+            } else {
+                30
+            }
+            // The container's KEY_FRAME_RATE is unreliable (it reported 10 for a 15+ fps clip on a
+            // Realme), so target maxFps: frame dropping never raises the rate of a slower source.
+            val targetFrameRate = maxFps.coerceAtLeast(1)
+            Log.i(LOG_TAG, "Frame rate: reported=$originalFrameRate target=$targetFrameRate")
+            val totalFrames = ((durationUs / 1_000_000.0) * targetFrameRate).toInt()
+            _progress.value = ProgressState(totalFrames = totalFrames)
+
+            // 2. Overlay bitmap (uploaded to the GPU once, then recycled)
+            val webpBytes = overlayFile.readBytes()
+            val webpInfo = webpEncoder.nativeGetInfo(webpBytes)
+                ?: throw IllegalStateException("Could not read WebP overlay info.")
+            val overlayWidth = webpInfo[0]
+            val overlayHeight = webpInfo[1]
+
+            val overlayBitmap = createBitmap(overlayWidth, overlayHeight)
             try {
-                // 1. Extractor Setup
-                extractor.setDataSource(videoFile.absolutePath)
-                val videoTrackIndex = (0 until extractor.trackCount).indexOfFirst {
-                    extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)
-                        ?.startsWith("video/") == true
-                }
-                if (videoTrackIndex == -1) throw IllegalStateException("No video track found")
-
-                val inputFormat = extractor.getTrackFormat(videoTrackIndex)
-                extractor.selectTrack(videoTrackIndex)
-
-                val videoWidth = inputFormat.getInteger(MediaFormat.KEY_WIDTH)
-                val videoHeight = inputFormat.getInteger(MediaFormat.KEY_HEIGHT)
-                val durationUs = inputFormat.getLong(MediaFormat.KEY_DURATION)
-
-                val originalFrameRate = if (inputFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
-                    inputFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
-                } else {
-                    30
-                }
-                val targetFrameRate = maxFps.let { min(it, originalFrameRate) } ?: originalFrameRate
-                val totalFrames = ((durationUs / 1_000_000.0) * targetFrameRate).toInt()
-                _progress.value = ProgressState(totalFrames = totalFrames)
-
-                val webpBytes = overlayFile.readBytes()
-                val webpInfo = webpEncoder.nativeGetInfo(webpBytes)
-                    ?: throw IllegalStateException("Could not read WebP overlay info.")
-                val overlayWidth = webpInfo[0]
-                val overlayHeight = webpInfo[1]
-
-                overlayBitmap = createBitmap(overlayWidth, overlayHeight)
-                val pixelBufferForOverlay = ByteBuffer.allocateDirect(overlayWidth * overlayHeight * 4)
+                val pixelBufferForOverlay =
+                    ByteBuffer.allocateDirect(overlayWidth * overlayHeight * 4)
                 if (!webpEncoder.nativeDecode(webpBytes, pixelBufferForOverlay, overlayWidth * 4)) {
                     throw IllegalStateException("Failed to decode WebP overlay image.")
                 }
@@ -197,12 +240,13 @@ class OverlayAndEncode {
                             }
                         }
                     }
+                }
 
-                    val outputBufferIndex = decoder.dequeueOutputBuffer(decoderBufferInfo, 10000L)
-                    if (outputBufferIndex >= 0) {
-                        if (decoderBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                            isDecoderOutputDone = true
-                        }
+                val outputBufferIndex = dec.dequeueOutputBuffer(decoderBufferInfo, 10_000L)
+                if (outputBufferIndex >= 0) {
+                    if (decoderBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        isDecoderOutputDone = true
+                    }
 
                         var processThisFrame = decoderBufferInfo.size > 0
                         if (processThisFrame) {
@@ -219,39 +263,67 @@ class OverlayAndEncode {
                                 lastProcessedTimestampUs = currentTimestampUs
                             }
                         }
+                    }
+                    // WhatsApp rejects animated stickers longer than 10 s: stop once the next frame
+                    // (plus the last frame's own duration) would exceed that.
+                    if (processThisFrame && firstPtsUs >= 0) {
+                        val nextMs = (decoderBufferInfo.presentationTimeUs - firstPtsUs + 500) / 1000
+                        if (nextMs + lastFrameDurationMs > MAX_DURATION_MS) {
+                            processThisFrame = false
+                            isDecoderOutputDone = true
+                        }
+                    }
 
-                        decoder.releaseOutputBuffer(outputBufferIndex, processThisFrame)
+                    dec.releaseOutputBuffer(outputBufferIndex, processThisFrame)
 
-                        if (processThisFrame) {
-                            try {
-                                glProcessor.awaitNewFrame()
-                                glProcessor.drawFrame(overlayBitmap)
-                                glProcessor.readPixels(pixelBufferForReadback)
+                    if (processThisFrame) {
+                        try {
+                            glProcessor.awaitNewFrame()
+                            consecutiveTimeouts = 0
+                            glProcessor.drawFrame()
 
-                                val timestampMs =
-                                    (decoderBufferInfo.presentationTimeUs / 1000).toInt()
-                                webpEncoder.nativeAddFrame(pixelBufferForReadback, timestampMs)
+                            val ptsUs = decoderBufferInfo.presentationTimeUs
+                            if (firstPtsUs < 0) firstPtsUs = ptsUs
+                            // Relative to the first frame, rounded to the nearest ms.
+                            val timestampMs = ((ptsUs - firstPtsUs + 500) / 1000).toInt()
 
-                                currentFrame++
-                                val progressPercentage =
-                                    decoderBufferInfo.presentationTimeUs.toFloat() / durationUs.toFloat()
-                                _progress.value =
-                                    ProgressState(progressPercentage, currentFrame, totalFrames)
-
-                            } catch (e: TimeoutException) {
-                                Log.w(LOG_TAG, "Timeout waiting for frame.")
+                            glProcessor.submitReadback(timestampMs)?.let { ready ->
+                                addFrame(ready, glProcessor.readyTimestampMs)
+                                glProcessor.releaseReadback()
                             }
+
+                            currentFrame++
+                            val fraction = if (durationUs > 0) {
+                                (ptsUs.toFloat() / durationUs.toFloat()).coerceIn(0f, 1f)
+                            } else {
+                                0f
+                            }
+                            _progress.value = ProgressState(fraction, currentFrame, totalFrames)
+                        } catch (e: TimeoutException) {
+                            if (++consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) throw e
+                            Log.w(LOG_TAG, "Timeout waiting for frame; the frame was dropped.")
                         }
                     }
                 }
-                webpData = webpEncoder.nativeReleaseEncoder()
-            } finally {
-                extractor.release()
-                decoder?.stop(); decoder?.release()
-                glProcessor.release()
-                overlayBitmap?.recycle()
             }
-            webpData
+
+            currentCoroutineContext().ensureActive()
+            glProcessor.finishReadback()?.let { ready ->
+                addFrame(ready, glProcessor.readyTimestampMs)
+                glProcessor.releaseReadback()
+            }
+            if (currentFrame == 0) throw IllegalStateException("No frames were encoded")
+
+            val result = webpEncoder.nativeReleaseEncoder(
+                encoderHandle, lastTimestampMs + lastFrameDurationMs
+            )
+            encoderHandle = 0L // the native side frees the encoder even when it fails
+            return result
+        } finally {
+            if (encoderHandle != 0L) webpEncoder.nativeDestroyEncoder(encoderHandle)
+            runCatching { extractor.release() }
+            decoder?.let { runCatching { it.stop() }; runCatching { it.release() } }
+            runCatching { glProcessor.release() }
         }
     }
 }
