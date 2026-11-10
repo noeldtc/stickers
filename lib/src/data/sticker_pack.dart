@@ -27,6 +27,16 @@ class StickerPack {
   Future<void> sendToWhatsapp() async {
     if (stickers.isEmpty) throw Exception("No stickers!");
 
+    // Imported animated stickers can exceed WhatsApp's 10 s limit: cut the extra frames.
+    if (animated) {
+      for (final s in stickers) {
+        final f = File(s.source);
+        if (!f.existsSync()) continue;
+        final cut = truncateAnimatedWebp(f.readAsBytesSync());
+        if (cut != null) f.writeAsBytesSync(cut);
+      }
+    }
+
     // WhatsApp only answers "handleStickerPackPreviewResult/failed"; name the offending sticker instead.
     final problems = <String>[];
     for (var i = 0; i < stickers.length; i++) {
