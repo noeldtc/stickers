@@ -44,6 +44,9 @@ class OverlayAndEncode {
     companion object {
         private const val LOG_TAG = "OverlayAndEncode"
         private const val OUTPUT_DIMENSION = 512
+
+        // WhatsApp rejects animated stickers longer than 10 000 ms.
+        private const val MAX_DURATION_US = 10_000_000L
     }
 
     /**
@@ -172,6 +175,7 @@ class OverlayAndEncode {
                     ByteBuffer.allocateDirect(OUTPUT_DIMENSION * OUTPUT_DIMENSION * 4)
 
                 var lastProcessedTimestampUs = -1L
+                var firstTimestampUs = -1L
                 val frameIntervalUs = 1_000_000L / targetFrameRate
 
                 while (!isDecoderOutputDone && currentCoroutineContext().isActive) {
@@ -203,7 +207,13 @@ class OverlayAndEncode {
                         var processThisFrame = decoderBufferInfo.size > 0
                         if (processThisFrame) {
                             val currentTimestampUs = decoderBufferInfo.presentationTimeUs
-                            if (lastProcessedTimestampUs != -1L && currentTimestampUs - lastProcessedTimestampUs < frameIntervalUs) {
+                            if (firstTimestampUs == -1L) firstTimestampUs = currentTimestampUs
+                            if (currentTimestampUs - firstTimestampUs + frameIntervalUs > MAX_DURATION_US) {
+                                // The last frame lasts one interval, so stop before exceeding the limit.
+                                processThisFrame = false
+                                isDecoderOutputDone = true
+                                Log.w(LOG_TAG, "Clip longer than 10 s: truncating at the WhatsApp limit.")
+                            } else if (lastProcessedTimestampUs != -1L && currentTimestampUs - lastProcessedTimestampUs < frameIntervalUs) {
                                 processThisFrame = false // Drop frame
                             } else {
                                 lastProcessedTimestampUs = currentTimestampUs
