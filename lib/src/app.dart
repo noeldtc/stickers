@@ -15,6 +15,7 @@ import 'package:stickers/src/pages/select_pack_page.dart';
 import 'package:stickers/src/pages/sticker_pack_page.dart';
 import 'package:stickers/src/pages/sticker_packs_page.dart';
 import 'package:stickers/src/pages/video_crop_page.dart';
+import 'package:stickers/src/twitter_media.dart';
 import 'package:stickers/src/util.dart';
 
 import 'settings/settings_controller.dart';
@@ -52,6 +53,7 @@ class StickersAppState extends State<StickersApp> {
   }
 
   SharedMedia? media;
+  TweetMedia? pending;
 
   // Platform messages are asynchronous, so we initialize in an async method.
   Future<void> initPlatformState() async {
@@ -59,7 +61,9 @@ class StickersAppState extends State<StickersApp> {
     media = await handler.getInitialSharedMedia();
     if (media != null) {
       debugPrint("Initial Media received");
-      await _processMedia(media!);
+      final received = media!;
+      media = null;
+      await _processMedia(received);
       setState(() {});
       homeState?.setState(() {});
     }
@@ -132,8 +136,13 @@ class StickersAppState extends State<StickersApp> {
             return MaterialPageRoute<void>(
               settings: routeSettings,
               builder: (BuildContext context) {
+                if (pending != null) {
+                  final page = SelectPackPage(pending!.path, type: pending!.type);
+                  pending = null;
+                  return page;
+                }
                 if (media != null) {
-                  final page = SelectPackPage(media!);
+                  final page = SelectPackPage(media!.attachments!.first!.path);
                   media = null;
                   return page;
                 }
@@ -176,6 +185,38 @@ class StickersAppState extends State<StickersApp> {
   }
 
   Future<void> _processMedia(SharedMedia media) async {
+    final tweetId = extractTweetId(media.content);
+    if (tweetId != null && (media.attachments == null || media.attachments!.isEmpty)) {
+      final ctx = navigatorKey.currentState?.context;
+      if (ctx != null) {
+        showDialog(
+          context: ctx,
+          barrierDismissible: false,
+          builder: (_) => const Center(child: CircularProgressIndicator()),
+        );
+      }
+      try {
+        final tweetMedia = await downloadTweetMedia(tweetId);
+        navigatorKey.currentState?.pop();
+        pending = tweetMedia;
+        // Rebuild the home route so it resolves to the pack selection page.
+        navigatorKey.currentState?.pushNamedAndRemoveUntil('/', (route) => false);
+      } on Exception catch (e) {
+        navigatorKey.currentState?.pop();
+        final errCtx = navigatorKey.currentState?.context;
+        if (errCtx != null && errCtx.mounted) {
+          showDialog(
+            context: errCtx,
+            builder: (context) => ErrorDialog(
+              message: e.toString(),
+              title: AppLocalizations.of(context)!.unrecognizedFormat,
+            ),
+          );
+        }
+      }
+      return;
+    }
+    if (media.attachments == null || media.attachments!.isEmpty) return;
     if (media.attachments!.first!.path.toLowerCase().endsWith(".stickify") ||
         media.attachments!.first!.path.toLowerCase().endsWith(".zip") ||
         media.attachments!.first!.path.toLowerCase().endsWith(".wastickers")) {
