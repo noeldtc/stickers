@@ -102,40 +102,29 @@ class LibWebP {
      */
     external fun nativeDecode(data: ByteArray, outBuffer: ByteBuffer, stride: Int): Boolean
 
-
-    external fun nativeAddFrameYuv(
-        yBuffer: ByteBuffer,
-        yStride: Int,
-        uBuffer: ByteBuffer,
-        uStride: Int,
-        vBuffer: ByteBuffer,
-        vStride: Int,
-        timestampMs: Int
-    )
-
     /**
-     * Initializes the WebP encoder with output settings.
-     * @param path The full path to the output .webp file.
-     * @param width The width of the frames.
-     * @param height The height of the frames.
-     * @return True if initialization was successful.
+     * Creates a WebP animation encoder.
+     * @return An opaque handle, or 0 if initialization failed.
      */
-    external fun nativeInitEncoder(
-        width: Int, height: Int, config: WebPConfig
-    ): Boolean
+    external fun nativeInitEncoder(width: Int, height: Int, config: WebPConfig): Long
 
     /**
      * Adds a single RGBA frame to the WebP animation.
-     * @param frameBuffer A direct ByteBuffer containing the RGBA pixel data.
-     * @param timestampMs The timestamp for this frame in milliseconds.
+     * @param frameBuffer A direct ByteBuffer containing width*height*4 bytes of RGBA.
+     * @param timestampMs The timestamp for this frame in milliseconds (strictly increasing).
+     * @return False if the frame could not be encoded.
      */
-    external fun nativeAddFrame(frameBuffer: ByteBuffer, timestampMs: Int)
+    external fun nativeAddFrame(handle: Long, frameBuffer: ByteBuffer, timestampMs: Int): Boolean
 
     /**
-     * Finalizes the WebP file, writes it to disk, and cleans up resources.
-     * @return The path to the output file if successful, otherwise null.
+     * Assembles the animation and frees the encoder; the handle is invalid afterwards.
+     * @param endTimestampMs Time at which the last frame stops being shown.
+     * @return The encoded file bytes, or null on failure.
      */
-    external fun nativeReleaseEncoder(): ByteArray?
+    external fun nativeReleaseEncoder(handle: Long, endTimestampMs: Int): ByteArray?
+
+    /** Frees an encoder without assembling it (error and cancel paths). */
+    external fun nativeDestroyEncoder(handle: Long)
 
     companion object {
         init {

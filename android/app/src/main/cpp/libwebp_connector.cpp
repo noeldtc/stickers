@@ -1,20 +1,24 @@
 #include <jni.h>
 #include <string>
+#include <cstring>
 #include <android/log.h>
 
 // libwebp headers
 #include "src/webp/encode.h"
 #include "src/webp/mux.h"
-#include "src/webp/encode.h"
-#include "src/webp/mux.h"
 #include "src/webp/decode.h"
 
-// Define a logging tag
 #define LOG_TAG "NativeEncoder"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#ifndef NDEBUG
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGD(...) ((void) 0)
+#endif
 
-// This struct will hold our encoder's state
+// Encoder state. Ownership is handed to Kotlin as an opaque jlong handle, so
+// several encoders can coexist and none leaks if Kotlin forgets about it.
 struct EncoderState {
     WebPAnimEncoder *anim_encoder = nullptr;
     WebPConfig config;
@@ -22,13 +26,32 @@ struct EncoderState {
     int frame_height = 0;
 };
 
-// Use a static pointer to hold the state across JNI calls.
-// In a more complex app, you might pass a pointer back to Kotlin as a long.
-static EncoderState *state = nullptr;
+static void destroyState(EncoderState *state) {
+    if (state == nullptr) return;
+    if (state->anim_encoder != nullptr) {
+        WebPAnimEncoderDelete(state->anim_encoder);
+    }
+    delete state;
+}
 
+static const char *getWebPErrorString(int error_code) {
+    switch (error_code) {
+        case VP8_ENC_OK: return "OK";
+        case VP8_ENC_ERROR_OUT_OF_MEMORY: return "OUT_OF_MEMORY";
+        case VP8_ENC_ERROR_BITSTREAM_OUT_OF_MEMORY: return "BITSTREAM_OUT_OF_MEMORY";
+        case VP8_ENC_ERROR_NULL_PARAMETER: return "NULL_PARAMETER";
+        case VP8_ENC_ERROR_INVALID_CONFIGURATION: return "INVALID_CONFIGURATION";
+        case VP8_ENC_ERROR_BAD_DIMENSION: return "BAD_DIMENSION";
+        case VP8_ENC_ERROR_PARTITION0_OVERFLOW: return "PARTITION0_OVERFLOW";
+        case VP8_ENC_ERROR_PARTITION_OVERFLOW: return "PARTITION_OVERFLOW";
+        case VP8_ENC_ERROR_BAD_WRITE: return "BAD_WRITE";
+        case VP8_ENC_ERROR_FILE_TOO_BIG: return "FILE_TOO_BIG";
+        case VP8_ENC_ERROR_USER_ABORT: return "USER_ABORT";
+        default: return "UNKNOWN_ERROR";
+    }
+}
 
 extern "C" {
-
 
 /**
  * Reads a WebP file's raw byte data to get its width and height.
@@ -39,8 +62,7 @@ Java_de_loicezt_stickers_video_LibWebP_nativeGetInfo(
         jobject /* this */,
         jbyteArray data) {
 
-    // Get a pointer to the raw byte data from the Java byte array
-    jbyte *bytes = env->GetByteArrayElements(data, NULL);
+    jbyte *bytes = env->GetByteArrayElements(data, nullptr);
     if (bytes == nullptr) {
         LOGE("nativeGetInfo: Could not get byte array elements.");
         return nullptr;
@@ -49,27 +71,20 @@ Java_de_loicezt_stickers_video_LibWebP_nativeGetInfo(
 
     int width = 0;
     int height = 0;
-
-    // Use WebPGetInfo to parse the header without decoding the whole image
-    if (!WebPGetInfo(reinterpret_cast<const uint8_t *>(bytes), size, &width, &height)) {
-        env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+    bool ok = WebPGetInfo(reinterpret_cast<const uint8_t *>(bytes), size, &width, &height);
+    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+    if (!ok) {
         LOGE("nativeGetInfo: WebPGetInfo failed. Invalid WebP data.");
         return nullptr;
     }
 
-    // Release the C-style array without copying back changes
-    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
-
-    // Create a new Java integer array to return the dimensions
     jintArray result = env->NewIntArray(2);
     if (result == nullptr) {
         LOGE("nativeGetInfo: Could not create new int array.");
         return nullptr;
     }
-
     jint info[2] = {width, height};
     env->SetIntArrayRegion(result, 0, 2, info);
-
     return result;
 }
 
@@ -84,43 +99,35 @@ Java_de_loicezt_stickers_video_LibWebP_nativeDecode(
         jobject out_buffer,
         jint stride) {
 
-    // Get a pointer to the input WebP file data
-    jbyte *in_bytes = env->GetByteArrayElements(data, NULL);
+    auto *out_pixels = static_cast<uint8_t *>(env->GetDirectBufferAddress(out_buffer));
+    if (out_pixels == nullptr) {
+        LOGE("nativeDecode: Could not get direct buffer address for output.");
+        return JNI_FALSE;
+    }
+    size_t out_size = env->GetDirectBufferCapacity(out_buffer);
+
+    jbyte *in_bytes = env->GetByteArrayElements(data, nullptr);
     if (in_bytes == nullptr) {
         LOGE("nativeDecode: Could not get byte array elements.");
         return JNI_FALSE;
     }
     size_t in_size = env->GetArrayLength(data);
 
-    // Get a direct pointer to the output ByteBuffer's memory
-    auto *out_pixels = static_cast<uint8_t *>(env->GetDirectBufferAddress(out_buffer));
-    if (out_pixels == nullptr) {
-        env->ReleaseByteArrayElements(data, in_bytes, JNI_ABORT);
-        LOGE("nativeDecode: Could not get direct buffer address for output.");
-        return JNI_FALSE;
-    }
-    size_t out_size = env->GetDirectBufferCapacity(out_buffer);
-
-    // Decode the WebP data directly into the provided RGBA buffer
     uint8_t *decoded_data = WebPDecodeRGBAInto(
-            reinterpret_cast<const uint8_t *>(in_bytes),
-            in_size,
-            out_pixels,
-            out_size,
-            stride);
-
-    // Clean up the input array reference
+            reinterpret_cast<const uint8_t *>(in_bytes), in_size, out_pixels, out_size, stride);
     env->ReleaseByteArrayElements(data, in_bytes, JNI_ABORT);
 
     if (decoded_data == nullptr) {
         LOGE("nativeDecode: WebPDecodeRGBAInto failed.");
         return JNI_FALSE;
     }
-
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL
+/**
+ * Creates an encoder and returns its opaque handle, or 0 on failure.
+ */
+JNIEXPORT jlong JNICALL
 Java_de_loicezt_stickers_video_LibWebP_nativeInitEncoder(
         JNIEnv *env,
         jobject /* this */,
@@ -128,89 +135,73 @@ Java_de_loicezt_stickers_video_LibWebP_nativeInitEncoder(
         jint height,
         jobject configJava) {
 
-    if (state != nullptr) {
-        LOGE("Encoder already initialized. Please release it first.");
-        return JNI_FALSE;
+    if (configJava == nullptr) {
+        LOGE("nativeInitEncoder: null config.");
+        return 0;
     }
 
-    state = new EncoderState();
+    auto *state = new EncoderState();
     state->frame_width = width;
     state->frame_height = height;
 
-    jclass configClass = env->GetObjectClass(configJava);
-
     if (!WebPConfigInit(&state->config)) {
         LOGE("Failed to initialize WebPConfig.");
-        delete state;
-        state = nullptr;
-        return JNI_FALSE;
+        destroyState(state);
+        return 0;
     }
-    // --- Helper lambdas to reduce boilerplate for JNI calls ---
+    // Sensible default when the caller leaves the value unset.
+    state->config.thread_level = 1;
 
-    // Helper to update an 'int' field in the C struct from a Java 'Integer'.
-    auto updateInt = [&](const char *fieldName, int &targetField) {
-        jfieldID fid = env->GetFieldID(configClass, fieldName, "Ljava/lang/Integer;");
-        if (fid == nullptr) return; // Field not found, skip.
-        jobject fieldObj = env->GetObjectField(configJava, fid);
-        if (fieldObj != nullptr) {
-            jclass intClass = env->FindClass("java/lang/Integer");
-            jmethodID mid = env->GetMethodID(intClass, "intValue", "()I");
-            targetField = env->CallIntMethod(fieldObj, mid);
-            env->DeleteLocalRef(intClass);
-            env->DeleteLocalRef(fieldObj);
+    // Look up classes and method ids once, not once per field.
+    jclass configClass = env->GetObjectClass(configJava);
+    jclass intClass = env->FindClass("java/lang/Integer");
+    jclass floatClass = env->FindClass("java/lang/Float");
+    jclass boolClass = env->FindClass("java/lang/Boolean");
+    jmethodID intValue = env->GetMethodID(intClass, "intValue", "()I");
+    jmethodID floatValue = env->GetMethodID(floatClass, "floatValue", "()F");
+    jmethodID boolValue = env->GetMethodID(boolClass, "booleanValue", "()Z");
+    jclass hintClass = env->FindClass("de/loicezt/stickers/video/WebPImageHint");
+    jmethodID ordinal = hintClass != nullptr ? env->GetMethodID(hintClass, "ordinal", "()I")
+                                             : nullptr;
+
+    auto getField = [&](const char *name, const char *sig) -> jobject {
+        jfieldID fid = env->GetFieldID(configClass, name, sig);
+        if (fid == nullptr) {
+            env->ExceptionClear();
+            LOGE("Config field not found: %s", name);
+            return nullptr;
+        }
+        return env->GetObjectField(configJava, fid);
+    };
+    auto updateInt = [&](const char *name, int &target) {
+        jobject obj = getField(name, "Ljava/lang/Integer;");
+        if (obj != nullptr) {
+            target = env->CallIntMethod(obj, intValue);
+            env->DeleteLocalRef(obj);
         }
     };
-
-    // Helper to update a 'float' field in the C struct from a Java 'Float'.
-    auto updateFloat = [&](const char *fieldName, float &targetField) {
-        jfieldID fid = env->GetFieldID(configClass, fieldName, "Ljava/lang/Float;");
-        if (fid == nullptr) return;
-        jobject fieldObj = env->GetObjectField(configJava, fid);
-        if (fieldObj != nullptr) {
-            jclass floatClass = env->FindClass("java/lang/Float");
-            jmethodID mid = env->GetMethodID(floatClass, "floatValue", "()F");
-            targetField = env->CallFloatMethod(fieldObj, mid);
-            env->DeleteLocalRef(floatClass);
-            env->DeleteLocalRef(fieldObj);
+    auto updateFloat = [&](const char *name, float &target) {
+        jobject obj = getField(name, "Ljava/lang/Float;");
+        if (obj != nullptr) {
+            target = env->CallFloatMethod(obj, floatValue);
+            env->DeleteLocalRef(obj);
         }
     };
-
-    // Helper to update an 'int' field in the C struct from a Java 'Boolean'.
-    auto updateBoolean = [&](const char *fieldName, int &targetField) {
-        jfieldID fid = env->GetFieldID(configClass, fieldName, "Ljava/lang/Boolean;");
-        if (fid == nullptr) return;
-        jobject fieldObj = env->GetObjectField(configJava, fid);
-        if (fieldObj != nullptr) {
-            jclass boolClass = env->FindClass("java/lang/Boolean");
-            jmethodID mid = env->GetMethodID(boolClass, "booleanValue", "()Z");
-            // Assigns 1 for true, 0 for false.
-            targetField = env->CallBooleanMethod(fieldObj, mid);
-            env->DeleteLocalRef(boolClass);
-            env->DeleteLocalRef(fieldObj);
+    auto updateBoolean = [&](const char *name, int &target) {
+        jobject obj = getField(name, "Ljava/lang/Boolean;");
+        if (obj != nullptr) {
+            target = env->CallBooleanMethod(obj, boolValue) ? 1 : 0;
+            env->DeleteLocalRef(obj);
         }
     };
-
-    // Helper to update an enum field in the C struct from a Java Enum.
-    // ⚠️ IMPORTANT: Replace "Lcom/yourpackage/WebPImageHint;" with the correct path to your enum class.
-    const char *webPImageHintSignature = "Lde/loicezt/stickers/video/WebPImageHint;";
-    auto updateEnum = [&](const char *fieldName, WebPImageHint &targetField) {
-        jfieldID fid = env->GetFieldID(configClass, fieldName, webPImageHintSignature);
-        if (fid == nullptr) return;
-        jobject fieldObj = env->GetObjectField(configJava, fid);
-        if (fieldObj != nullptr) {
-            jclass enumClass = env->GetObjectClass(fieldObj);
-            jmethodID mid = env->GetMethodID(enumClass, "ordinal", "()I");
-            // Get the enum's ordinal value and cast it to the C enum type.
-            targetField = static_cast<WebPImageHint>(env->CallIntMethod(fieldObj, mid));
-            env->DeleteLocalRef(enumClass);
-            env->DeleteLocalRef(fieldObj);
+    auto updateEnum = [&](const char *name, WebPImageHint &target) {
+        if (ordinal == nullptr) return;
+        jobject obj = getField(name, "Lde/loicezt/stickers/video/WebPImageHint;");
+        if (obj != nullptr) {
+            target = static_cast<WebPImageHint>(env->CallIntMethod(obj, ordinal));
+            env->DeleteLocalRef(obj);
         }
     };
-
-
-    // --- Map and Update Each Field ---
-    // The first argument is the Kotlin field name (camelCase).
-    // The second argument is a reference to the C struct field (snake_case).
 
     updateBoolean("lossless", state->config.lossless);
     updateFloat("quality", state->config.quality);
@@ -238,228 +229,147 @@ Java_de_loicezt_stickers_video_LibWebP_nativeInitEncoder(
     updateInt("nearLossless", state->config.near_lossless);
     updateInt("exact", state->config.exact);
 
-    // Clean up the local reference to the class object.
     env->DeleteLocalRef(configClass);
+    env->DeleteLocalRef(intClass);
+    env->DeleteLocalRef(floatClass);
+    env->DeleteLocalRef(boolClass);
+    if (hintClass != nullptr) env->DeleteLocalRef(hintClass);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        LOGE("JNI exception while reading config.");
+        destroyState(state);
+        return 0;
+    }
 
     if (!WebPValidateConfig(&state->config)) {
         LOGE("Invalid config");
-        delete state;
-        state = nullptr;
-        return JNI_FALSE;
+        destroyState(state);
+        return 0;
     }
 
-    // 2. Setup the animation encoder
     WebPAnimEncoderOptions anim_options;
-    anim_options.verbose = 1;
-    WebPAnimEncoderOptionsInit(&anim_options);
+    if (!WebPAnimEncoderOptionsInit(&anim_options)) {
+        LOGE("Failed to init WebPAnimEncoderOptions.");
+        destroyState(state);
+        return 0;
+    }
     state->anim_encoder = WebPAnimEncoderNew(width, height, &anim_options);
     if (state->anim_encoder == nullptr) {
         LOGE("Failed to create new WebPAnimEncoder.");
-        delete state;
-        state = nullptr;
-        return JNI_FALSE;
+        destroyState(state);
+        return 0;
     }
 
     LOGI("Native encoder initialized successfully for %dx%d.", width, height);
-    return JNI_TRUE;
+    return reinterpret_cast<jlong>(state);
 }
 
-
-JNIEXPORT void JNICALL
-Java_de_loicezt_stickers_video_LibWebP_nativeAddFrameYuv(
-        JNIEnv *env,
-        jobject /* this */,
-        jobject y_buffer, jint y_stride,
-        jobject u_buffer, jint u_stride,
-        jobject v_buffer, jint v_stride,
-        jint timestamp_ms) {
-
-    if (state == nullptr || state->anim_encoder == nullptr) {
-        LOGE("Cannot add frame. Encoder not initialized.");
-        return;
-    }
-
-    // Get direct pointers to the pixel data for each plane
-    auto *y_pixels = static_cast<uint8_t *>(env->GetDirectBufferAddress(y_buffer));
-    auto *u_pixels = static_cast<uint8_t *>(env->GetDirectBufferAddress(u_buffer));
-    auto *v_pixels = static_cast<uint8_t *>(env->GetDirectBufferAddress(v_buffer));
-
-    if (y_pixels == nullptr || u_pixels == nullptr || v_pixels == nullptr) {
-        LOGE("Failed to get direct buffer address for one or more planes.");
-        return;
-    }
-
-    // --- KEY CHANGE: Manually set up the YUV picture from the planes ---
-    WebPPicture pic;
-    if (!WebPPictureInit(&pic)) {
-        LOGE("Failed to init WebPPicture");
-        return;
-    }
-    pic.width = state->frame_width;
-    pic.height = state->frame_height;
-    pic.use_argb = 0; // We are providing YUV data
-
-    // Set pointers to the Y, U, and V planes
-    pic.y = y_pixels;
-    pic.u = u_pixels;
-    pic.v = v_pixels;
-
-    // Set the stride for each plane
-    pic.y_stride = y_stride;
-    pic.uv_stride = u_stride; // For YUV420, U and V strides are the same
-
-    // 4. Add the YUV picture to the animation encoder
-    if (!WebPAnimEncoderAdd(state->anim_encoder, &pic, timestamp_ms, &state->config)) {
-        LOGE("Failed to add YUV frame to WebPAnimEncoder at timestamp %d", timestamp_ms);
-    }
-
-    // WebPPictureFree(&pic) is NOT needed here because we didn't allocate memory with it.
-    // The memory is owned by the MediaCodec Image, which we closed in Kotlin.
-}
-const char *getWebPErrorString(int error_code) {
-    switch (error_code) {
-        case VP8_ENC_OK:
-            return "OK";
-        case VP8_ENC_ERROR_OUT_OF_MEMORY:
-            return "OUT_OF_MEMORY";
-        case VP8_ENC_ERROR_BITSTREAM_OUT_OF_MEMORY:
-            return "BITSTREAM_OUT_OF_MEMORY";
-        case VP8_ENC_ERROR_NULL_PARAMETER:
-            return "NULL_PARAMETER";
-        case VP8_ENC_ERROR_INVALID_CONFIGURATION:
-            return "INVALID_CONFIGURATION";
-        case VP8_ENC_ERROR_BAD_DIMENSION:
-            return "BAD_DIMENSION";
-        case VP8_ENC_ERROR_PARTITION0_OVERFLOW:
-            return "PARTITION0_OVERFLOW";
-        case VP8_ENC_ERROR_PARTITION_OVERFLOW:
-            return "PARTITION_OVERFLOW";
-        case VP8_ENC_ERROR_BAD_WRITE:
-            return "BAD_WRITE";
-        case VP8_ENC_ERROR_FILE_TOO_BIG:
-            return "FILE_TOO_BIG";
-        case VP8_ENC_ERROR_USER_ABORT:
-            return "USER_ABORT";
-        default:
-            return "UNKNOWN_ERROR";
-    }
-}
-
-// --- NEW: Helper function to log the entire WebPConfig struct ---
-void logWebPConfig(const WebPConfig *config) {
-    LOGI("--- WebPConfig State ---");
-    LOGI("  lossless: %d", config->lossless);
-    LOGI("  quality: %.1f", config->quality);
-    LOGI("  method: %d", config->method);
-    LOGI("  image_hint: %d", config->image_hint);
-    LOGI("  target_size: %d", config->target_size);
-    LOGI("  target_PSNR: %.1f", config->target_PSNR);
-    LOGI("  segments: %d", config->segments);
-    LOGI("  sns_strength: %d", config->sns_strength);
-    LOGI("  filter_strength: %d", config->filter_strength);
-    LOGI("  filter_sharpness: %d", config->filter_sharpness);
-    LOGI("  filter_type: %d", config->filter_type);
-    LOGI("  autofilter: %d", config->autofilter);
-    LOGI("  alpha_compression: %d", config->alpha_compression);
-    LOGI("  alpha_filtering: %d", config->alpha_filtering);
-    LOGI("  alpha_quality: %d", config->alpha_quality);
-    LOGI("  pass: %d", config->pass);
-    LOGI("  show_compressed: %d", config->show_compressed);
-    LOGI("  preprocessing: %d", config->preprocessing);
-    LOGI("  partitions: %d", config->partitions);
-    LOGI("  partition_limit: %d", config->partition_limit);
-    LOGI("  emulate_jpeg_size: %d", config->emulate_jpeg_size);
-    LOGI("  thread_level: %d", config->thread_level);
-    LOGI("  low_memory: %d", config->low_memory);
-    LOGI("  near_lossless: %d", config->near_lossless);
-    LOGI("  exact: %d", config->exact);
-    LOGI("  use_sharp_yuv: %d", config->use_sharp_yuv);
-    LOGI("  qmin: %d", config->qmin);
-    LOGI("  qmax: %d", config->qmax);
-    LOGI("------------------------");
-}
-JNIEXPORT void JNICALL
+/**
+ * Adds one RGBA frame. Returns false if the frame could not be encoded.
+ */
+JNIEXPORT jboolean JNICALL
 Java_de_loicezt_stickers_video_LibWebP_nativeAddFrame(
         JNIEnv *env,
         jobject /* this */,
+        jlong handle,
         jobject frameBuffer,
         jint timestampMs) {
 
+    auto *state = reinterpret_cast<EncoderState *>(handle);
     if (state == nullptr || state->anim_encoder == nullptr) {
         LOGE("Cannot add frame. Encoder not initialized.");
-        return;
+        return JNI_FALSE;
     }
 
-    // Get a direct pointer to the pixel data from the Java ByteBuffer
     auto *pixels = static_cast<uint8_t *>(env->GetDirectBufferAddress(frameBuffer));
     if (pixels == nullptr) {
         LOGE("Failed to get direct buffer address.");
-        return;
+        return JNI_FALSE;
+    }
+    const jlong capacity = env->GetDirectBufferCapacity(frameBuffer);
+    if (capacity < static_cast<jlong>(state->frame_width) * state->frame_height * 4) {
+        LOGE("Frame buffer too small (%lld bytes).", static_cast<long long>(capacity));
+        return JNI_FALSE;
     }
 
-    // 3. Create a WebPPicture and import the pixels
     WebPPicture pic;
     if (!WebPPictureInit(&pic)) {
         LOGE("Failed to init WebPPicture");
-        return;
+        return JNI_FALSE;
     }
     pic.width = state->frame_width;
     pic.height = state->frame_height;
-    pic.use_argb = 1; // We are providing RGBA data
+    pic.use_argb = 1;
 
-    // Import the RGBA data. The stride is the number of bytes per row.
-    WebPPictureImportRGBA(&pic, pixels, state->frame_width * 4);
-
-    // 4. Add the picture to the animation encoder
-    //logWebPConfig(&state->config);
-    if (!WebPAnimEncoderAdd(state->anim_encoder, &pic, timestampMs, &state->config)) {
-        const char *error_string = getWebPErrorString(pic.error_code);
-        LOGE("Failed to add frame to WebPAnimEncoder at timestamp %d. Error: %s (%d)",
-             timestampMs, error_string, pic.error_code);
-    } else {
-        LOGI("Added frame at Timestamp %d", timestampMs);
+    if (!WebPPictureImportRGBA(&pic, pixels, state->frame_width * 4)) {
+        LOGE("WebPPictureImportRGBA failed: %s (%d)", getWebPErrorString(pic.error_code),
+             pic.error_code);
+        WebPPictureFree(&pic);
+        return JNI_FALSE;
     }
 
-    WebPPictureFree(&pic); // Free the picture memory
+    bool ok = WebPAnimEncoderAdd(state->anim_encoder, &pic, timestampMs, &state->config);
+    if (!ok) {
+        LOGE("Failed to add frame at %d ms. Error: %s (%d)", timestampMs,
+             getWebPErrorString(pic.error_code), pic.error_code);
+    } else {
+        LOGD("Added frame at timestamp %d", timestampMs);
+    }
+    WebPPictureFree(&pic);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+/**
+ * Assembles the animation and frees the encoder. endTimestampMs is the time at
+ * which the last frame stops being shown. Always invalidates the handle.
+ */
 JNIEXPORT jbyteArray JNICALL
 Java_de_loicezt_stickers_video_LibWebP_nativeReleaseEncoder(
         JNIEnv *env,
-        jobject /* this */) {
+        jobject /* this */,
+        jlong handle,
+        jint endTimestampMs) {
 
-
-    if (state == nullptr) { /* ... error handling ... */ return nullptr; }
-
-    // Assemble the animation
-    WebPAnimEncoderAdd(state->anim_encoder, nullptr, 0, nullptr);
-    WebPData webp_data;
-    WebPDataInit(&webp_data);
-    if (!WebPAnimEncoderAssemble(state->anim_encoder, &webp_data)) {
-        LOGE("Failed to assemble final WebP animation.");
-        WebPAnimEncoderDelete(state->anim_encoder);
-        delete state;
-        state = nullptr;
+    auto *state = reinterpret_cast<EncoderState *>(handle);
+    if (state == nullptr || state->anim_encoder == nullptr) {
+        LOGE("nativeReleaseEncoder: encoder not initialized.");
+        destroyState(state);
         return nullptr;
     }
 
-    LOGI("Successfully assembled WebP data. Size: %zu bytes", webp_data.size);
+    jbyteArray result = nullptr;
+    WebPData webp_data;
+    WebPDataInit(&webp_data);
 
-    // --- NEW: Create a Java byte array and copy the data into it ---
-    jbyteArray byteArray = env->NewByteArray(webp_data.size);
-    void *temp = env->GetPrimitiveArrayCritical(byteArray, nullptr);
-    memcpy(temp, webp_data.bytes, webp_data.size);
-    env->ReleasePrimitiveArrayCritical(byteArray, temp, 0);
-    // --- End of new code ---
+    if (!WebPAnimEncoderAdd(state->anim_encoder, nullptr, endTimestampMs, nullptr)) {
+        LOGE("Failed to flush WebPAnimEncoder.");
+    } else if (!WebPAnimEncoderAssemble(state->anim_encoder, &webp_data)) {
+        LOGE("Failed to assemble final WebP animation.");
+    } else {
+        LOGI("Assembled WebP data. Size: %zu bytes", webp_data.size);
+        result = env->NewByteArray(static_cast<jsize>(webp_data.size));
+        if (result == nullptr) {
+            LOGE("Could not allocate result byte array.");
+        } else {
+            env->SetByteArrayRegion(result, 0, static_cast<jsize>(webp_data.size),
+                                    reinterpret_cast<const jbyte *>(webp_data.bytes));
+        }
+    }
 
-    // Cleanup
     WebPDataClear(&webp_data);
-    WebPAnimEncoderDelete(state->anim_encoder);
-    delete state;
-    state = nullptr;
+    destroyState(state);
+    return result;
+}
 
-    LOGI("Native encoder released.");
-    return byteArray; // Return the raw data to Kotlin
+/**
+ * Frees an encoder without assembling it (error and cancel paths).
+ */
+JNIEXPORT void JNICALL
+Java_de_loicezt_stickers_video_LibWebP_nativeDestroyEncoder(
+        JNIEnv * /* env */,
+        jobject /* this */,
+        jlong handle) {
+    destroyState(reinterpret_cast<EncoderState *>(handle));
 }
 
 } // extern "C"
