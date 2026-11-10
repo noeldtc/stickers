@@ -83,4 +83,7 @@ flutter {
     source '../..'
 }
 
-dependencies {}
+dependencies {
+    // Java MP4 parser: the Realme/ColorOS system MediaExtractor returns 0 tracks for valid MP4s.
+    implementation "androidx.media3:media3-exoplayer:1.5.1"
+}

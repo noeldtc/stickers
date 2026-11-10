@@ -115,12 +115,15 @@ class CropScaleGL : SurfaceTexture.OnFrameAvailableListener {
     }
 
     fun release() {
-        decoderInputSurface.release()
-        decoderSurfaceTexture.release()
-        EGL14.eglDestroySurface(eglDisplay, eglSurface)
-        EGL14.eglDestroyContext(eglDisplay, eglContext)
-        EGL14.eglReleaseThread()
-        EGL14.eglTerminate(eglDisplay)
+        // May be called after a failed/partial setup(), so guard every resource.
+        if (::decoderInputSurface.isInitialized) decoderInputSurface.release()
+        if (::decoderSurfaceTexture.isInitialized) decoderSurfaceTexture.release()
+        if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+            EGL14.eglDestroySurface(eglDisplay, eglSurface)
+            EGL14.eglDestroyContext(eglDisplay, eglContext)
+            EGL14.eglReleaseThread()
+            EGL14.eglTerminate(eglDisplay)
+        }
     }
 
     private fun createProgram(vertexSource: String, fragmentSource: String): Int {
