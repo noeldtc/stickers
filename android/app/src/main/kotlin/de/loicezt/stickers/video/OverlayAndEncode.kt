@@ -51,9 +51,8 @@ class OverlayAndEncode {
     companion object {
         private const val LOG_TAG = "OverlayAndEncode"
         private const val OUTPUT_DIMENSION = 512
-
-        // WhatsApp rejects animated stickers longer than 10 000 ms.
-        private const val MAX_DURATION_US = 10_000_000L
+        private const val MAX_CONSECUTIVE_TIMEOUTS = 3
+        private const val MAX_DURATION_MS = 10_000
     }
 
     /**
@@ -76,11 +75,9 @@ class OverlayAndEncode {
         _progress.value = ProgressState()
         _status.value = State.RUNNING
 
-        // Set synchronously: Flutter subscribes right after start() returns and would otherwise
-        // replay the previous run's SUCCESS/FAILED, reading the output file before it exists.
-        _status.value = State.RUNNING
-        _progress.value = ProgressState()
         encodeJob = scope.launch {
+            // Write to a temp file and rename, so a failure never leaves a partial output.
+            val tempFile = File(outputFile.path + ".tmp")
             try {
                 val webpData = doOverlayAndEncode(videoFile, overlayFile, config, maxFps)
                     ?: throw IllegalStateException("Encoding produced no data.")
@@ -203,41 +200,61 @@ class OverlayAndEncode {
                 pixelBufferForOverlay.rewind()
                 overlayBitmap.copyPixelsFromBuffer(pixelBufferForOverlay)
 
-                glProcessor.setup(OUTPUT_DIMENSION, OUTPUT_DIMENSION, videoWidth, videoHeight)
-                webpEncoder.nativeInitEncoder(OUTPUT_DIMENSION, OUTPUT_DIMENSION, config)
+                glProcessor.setup(
+                    OUTPUT_DIMENSION, OUTPUT_DIMENSION, videoWidth, videoHeight, rotation,
+                    overlayBitmap
+                )
+            } finally {
+                overlayBitmap.recycle()
+            }
 
-                decoder = MediaCodec.createDecoderByType(inputFormat.getString(MediaFormat.KEY_MIME)!!)
-                decoder.configure(inputFormat, glProcessor.decoderInputSurface, null, 0)
-                decoder.start()
+            encoderHandle = webpEncoder.nativeInitEncoder(OUTPUT_DIMENSION, OUTPUT_DIMENSION, config)
+            if (encoderHandle == 0L) throw IllegalStateException("Could not initialize WebP encoder.")
 
-                val decoderBufferInfo = MediaCodec.BufferInfo()
-                var isInputDone = false
-                var isDecoderOutputDone = false
-                var currentFrame = 0
-                val pixelBufferForReadback =
-                    ByteBuffer.allocateDirect(OUTPUT_DIMENSION * OUTPUT_DIMENSION * 4)
+            val dec = MediaCodec.createDecoderByType(inputFormat.getString(MediaFormat.KEY_MIME)!!)
+            decoder = dec
+            dec.configure(inputFormat, glProcessor.decoderInputSurface, null, 0)
+            dec.start()
 
-                var lastProcessedTimestampUs = -1L
-                var firstTimestampUs = -1L
-                val frameIntervalUs = 1_000_000L / targetFrameRate
+            val handle = encoderHandle
+            var lastTimestampMs = -1
+            fun addFrame(buffer: ByteBuffer, timestampMs: Int) {
+                // The encoder requires strictly increasing timestamps.
+                val ts = if (timestampMs <= lastTimestampMs) lastTimestampMs + 1 else timestampMs
+                if (!webpEncoder.nativeAddFrame(handle, buffer, ts)) {
+                    throw IllegalStateException("Failed to encode frame at $ts ms.")
+                }
+                lastTimestampMs = ts
+            }
 
-                while (!isDecoderOutputDone && currentCoroutineContext().isActive) {
-                    if (!isInputDone) {
-                        val inputBufferIndex = decoder.dequeueInputBuffer(10000L)
-                        if (inputBufferIndex >= 0) {
-                            val sampleSize =
-                                extractor.readSampleData(decoder.getInputBuffer(inputBufferIndex)!!, 0)
-                            if (sampleSize < 0) {
-                                decoder.queueInputBuffer(
-                                    inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                )
-                                isInputDone = true
-                            } else {
-                                decoder.queueInputBuffer(
-                                    inputBufferIndex, 0, sampleSize, extractor.sampleTime, 0
-                                )
-                                extractor.advance()
-                            }
+            // 3. Decode -> draw -> read back -> encode
+            val decoderBufferInfo = MediaCodec.BufferInfo()
+            var isInputDone = false
+            var isDecoderOutputDone = false
+            var currentFrame = 0
+            var consecutiveTimeouts = 0
+            var firstPtsUs = -1L
+            var lastProcessedTimestampUs = -1L
+            val frameIntervalUs = 1_000_000L / targetFrameRate
+            // The last frame stays visible for one frame interval.
+            val lastFrameDurationMs = max(1, (1000.0 / targetFrameRate).roundToInt())
+
+            while (!isDecoderOutputDone && currentCoroutineContext().isActive) {
+                if (!isInputDone) {
+                    val inputBufferIndex = dec.dequeueInputBuffer(10_000L)
+                    if (inputBufferIndex >= 0) {
+                        val sampleSize =
+                            extractor.readSampleData(dec.getInputBuffer(inputBufferIndex)!!, 0)
+                        if (sampleSize < 0) {
+                            dec.queueInputBuffer(
+                                inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            isInputDone = true
+                        } else {
+                            dec.queueInputBuffer(
+                                inputBufferIndex, 0, sampleSize, extractor.sampleTime, 0
+                            )
+                            extractor.advance()
                         }
                     }
                 }
@@ -248,20 +265,15 @@ class OverlayAndEncode {
                         isDecoderOutputDone = true
                     }
 
-                        var processThisFrame = decoderBufferInfo.size > 0
-                        if (processThisFrame) {
-                            val currentTimestampUs = decoderBufferInfo.presentationTimeUs
-                            if (firstTimestampUs == -1L) firstTimestampUs = currentTimestampUs
-                            if (currentTimestampUs - firstTimestampUs + frameIntervalUs > MAX_DURATION_US) {
-                                // The last frame lasts one interval, so stop before exceeding the limit.
-                                processThisFrame = false
-                                isDecoderOutputDone = true
-                                Log.w(LOG_TAG, "Clip longer than 10 s: truncating at the WhatsApp limit.")
-                            } else if (lastProcessedTimestampUs != -1L && currentTimestampUs - lastProcessedTimestampUs < frameIntervalUs) {
-                                processThisFrame = false // Drop frame
-                            } else {
-                                lastProcessedTimestampUs = currentTimestampUs
-                            }
+                    var processThisFrame = decoderBufferInfo.size > 0
+                    if (processThisFrame) {
+                        val currentTimestampUs = decoderBufferInfo.presentationTimeUs
+                        if (lastProcessedTimestampUs != -1L &&
+                            currentTimestampUs - lastProcessedTimestampUs < frameIntervalUs
+                        ) {
+                            processThisFrame = false // Drop frame
+                        } else {
+                            lastProcessedTimestampUs = currentTimestampUs
                         }
                     }
                     // WhatsApp rejects animated stickers longer than 10 s: stop once the next frame

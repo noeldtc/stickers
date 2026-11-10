@@ -86,10 +86,6 @@ class CropAndScale(private val context: Context) {
         _progress.value = ProgressState()
         _status.value = State.RUNNING
 
-        // Set synchronously: Flutter subscribes right after start() returns and would otherwise
-        // replay the previous run's SUCCESS/FAILED state.
-        _status.value = State.RUNNING
-        _progress.value = ProgressState()
         transcodeJob = scope.launch {
             try {
                 doTranscode(inputFile, outputFile, startTimeUs, endTimeUs, maxFps)
