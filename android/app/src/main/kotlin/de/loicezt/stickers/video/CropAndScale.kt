@@ -1,6 +1,9 @@
 package de.loicezt.stickers.video
 
+import android.content.Context
 import android.media.MediaCodec
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.MediaExtractorCompat
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -32,7 +35,8 @@ import kotlin.math.min
  * @param totalFrames The estimated total number of frames in the source video.
  */
 
-class CropAndScale {
+@OptIn(UnstableApi::class)
+class CropAndScale(private val context: Context) {
 
     /**
      * Represents the current state of the transcoder.
@@ -122,7 +126,7 @@ class CropAndScale {
         endTimeUs: Long,
         maxFps: Int
     ) {
-        val extractor = MediaExtractor()
+        val extractor = MediaExtractorCompat(context)
         var decoder: MediaCodec? = null
         var encoder: MediaCodec? = null
         var muxer: MediaMuxer? = null
@@ -130,7 +134,7 @@ class CropAndScale {
         val transcoderExecutor = Executors.newSingleThreadExecutor()
 
         try {
-            extractor.setDataSource(inputFile.absolutePath)
+            extractor.setDataSource(android.net.Uri.fromFile(inputFile), 0L)
             var videoTrackIndex = -1
             for (i in 0 until extractor.trackCount) {
                 val format = extractor.getTrackFormat(i)
@@ -139,12 +143,25 @@ class CropAndScale {
                     break
                 }
             }
-            if (videoTrackIndex == -1) throw IllegalStateException("No video track found")
+            if (videoTrackIndex == -1) {
+                val mimes = (0 until extractor.trackCount).map {
+                    extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)
+                }
+                throw IllegalStateException(
+                    "No video track found (path=${inputFile.absolutePath}, exists=${inputFile.exists()}, " +
+                            "size=${inputFile.length()}, tracks=$mimes)"
+                )
+            }
 
             val inputFormat = extractor.getTrackFormat(videoTrackIndex)
             extractor.selectTrack(videoTrackIndex)
 
-            val originalDurationUs = inputFormat.getLong(MediaFormat.KEY_DURATION)
+            // MediaExtractorCompat may omit KEY_DURATION; the requested end is already clamped by Dart.
+            val originalDurationUs = if (inputFormat.containsKey(MediaFormat.KEY_DURATION)) {
+                inputFormat.getLong(MediaFormat.KEY_DURATION)
+            } else {
+                endTimeUs
+            }
             val effectiveStartTimeUs = startTimeUs
             val effectiveEndTimeUs = min(endTimeUs, originalDurationUs)
             val trimmedDurationUs = effectiveEndTimeUs - effectiveStartTimeUs
@@ -156,7 +173,10 @@ class CropAndScale {
             val videoHeight = inputFormat.getInteger(MediaFormat.KEY_HEIGHT)
 
             val originalFrameRate = if (inputFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
-                inputFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
+                // MediaExtractorCompat reports the frame rate as a Float.
+                runCatching { inputFormat.getInteger(MediaFormat.KEY_FRAME_RATE) }
+                    .getOrElse { inputFormat.getFloat(MediaFormat.KEY_FRAME_RATE).toInt() }
+                    .coerceAtLeast(1)
             } else {
                 24
             }
@@ -312,11 +332,12 @@ class CropAndScale {
             }
             encoderDone.join()
         } finally {
-            extractor.release()
-            decoder?.stop(); decoder?.release()
-            encoder?.stop(); encoder?.release()
-            muxer?.stop(); muxer?.release()
-            glProcessor.release()
+            // Cleanup must never throw: it would mask the original exception.
+            runCatching { extractor.release() }
+            runCatching { decoder?.stop(); decoder?.release() }
+            runCatching { encoder?.stop(); encoder?.release() }
+            runCatching { muxer?.stop(); muxer?.release() }
+            runCatching { glProcessor.release() }
             transcoderExecutor.shutdown()
         }
     }

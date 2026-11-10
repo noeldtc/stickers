@@ -32,7 +32,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        cropAndScale = CropAndScale()
+        cropAndScale = CropAndScale(applicationContext)
         overlayAndEncode = OverlayAndEncode()
 
         // 1. Setup the MethodChannel to receive commands from Flutter
