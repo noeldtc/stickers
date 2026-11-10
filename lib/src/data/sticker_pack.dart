@@ -5,6 +5,7 @@ import 'package:image_editor/image_editor.dart';
 import 'package:stickers/src/constants.dart';
 import 'package:stickers/src/data/load_store.dart';
 import 'package:stickers/src/data/sticker.dart';
+import 'package:stickers/src/data/sticker_validator.dart';
 import 'package:stickers/src/globals.dart';
 import 'package:whatsapp_stickers_plus/whatsapp_stickers.dart';
 
@@ -25,6 +26,17 @@ class StickerPack {
 
   Future<void> sendToWhatsapp() async {
     if (stickers.isEmpty) throw Exception("No stickers!");
+
+    // WhatsApp only answers "handleStickerPackPreviewResult/failed"; name the offending sticker instead.
+    final problems = <String>[];
+    for (var i = 0; i < stickers.length; i++) {
+      final p = validateStickerFile(stickers[i].source, animated: animated);
+      if (p != null) problems.add("Sticker ${i + 1} (${stickers[i].source.split(RegExp(r'[\\/]')).last}): $p");
+    }
+    if (stickers.length < 3 || stickers.length > 30) {
+      problems.add("A pack needs 3 to 30 stickers (has ${stickers.length})");
+    }
+    if (problems.isNotEmpty) throw Exception("WhatsApp would reject this pack:\n${problems.join('\n')}");
 
     ImageEditorOption scale = ImageEditorOption();
     scale.addOption(const ScaleOption(96, 96));
