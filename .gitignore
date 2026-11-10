@@ -50,3 +50,8 @@ app.*.map.json
 
 api_keys.dart
 
+
+# Firma local: nunca al repositorio
+key.properties
+*.jks
+*.keystore
