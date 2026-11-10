@@ -36,15 +36,16 @@ Future<void> sendToWhatsappWithErrorHandling(StickerPack pack, BuildContext cont
   try {
     await pack.sendToWhatsapp();
   } on WhatsappStickersAlreadyAddedException catch (_) {
-  } on WhatsappStickersException catch (e) {
+  } on WhatsappStickersException catch (e, st) {
     showDialog(
       context: navigatorKey.currentContext!,
       builder: (_) => ErrorDialog(
         title: AppLocalizations.of(context)!.couldnTAddStickerPack,
         message: e.cause ?? e.runtimeType.toString(),
+        details: st.toString(),
       ),
     );
-  } on PlatformException catch (e) {
+  } on PlatformException catch (e, st) {
     if (e.message == "WhatsApp is not installed on target device!") {
       showDialog(
           context: navigatorKey.currentContext!,
@@ -54,13 +55,17 @@ Future<void> sendToWhatsappWithErrorHandling(StickerPack pack, BuildContext cont
     } else {
       showDialog(
           context: navigatorKey.currentContext!,
-          builder: (_) =>
-              ErrorDialog(title: AppLocalizations.of(context)!.couldnTAddStickerPack, message: e.message ?? ""));
+          builder: (_) => ErrorDialog(
+                title: AppLocalizations.of(context)!.couldnTAddStickerPack,
+                message: e.message ?? "",
+                details: 'PlatformException(${e.code}, ${e.message}, ${e.details})\n${e.stacktrace ?? ''}\n$st',
+              ));
     }
-  } on Exception catch (e) {
+  } on Exception catch (e, st) {
     showDialog(
         context: navigatorKey.currentContext!,
-        builder: (_) => ErrorDialog(title: AppLocalizations.of(context)!.couldnTAddStickerPack, message: e.toString()));
+        builder: (_) => ErrorDialog(
+            title: AppLocalizations.of(context)!.couldnTAddStickerPack, message: e.toString(), details: st.toString()));
   }
 }
 
