@@ -2,45 +2,45 @@ package de.loicezt.stickers.video
 
 import android.content.Context
 import android.media.MediaCodec
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.MediaExtractorCompat
 import android.media.MediaCodecInfo
-import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
-import android.os.Build
+import android.net.Uri
 import android.util.Log
-import androidx.annotation.RequiresApi
+import androidx.annotation.OptIn
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.MediaExtractorCompat
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Data class to hold all progress information.
- * @param progress A float between 0.0 and 1.0 representing the overall progress.
- * @param currentFrame The number of frames processed so far.
- * @param totalFrames The estimated total number of frames in the source video.
+ * Trims a video and scales it so its longest side is [TARGET_LONGEST_SIDE], re-encoding to H.264.
+ * Observe [status] and [progress] for updates.
+ *
+ * The input is read with Media3's [MediaExtractorCompat] (a Java MP4 parser) because the
+ * Realme/ColorOS system MediaExtractor returns 0 tracks for valid H.264 MP4s.
  */
-
 @OptIn(UnstableApi::class)
 class CropAndScale(private val context: Context) {
 
-    /**
-     * Represents the current state of the transcoder.
-     */
     enum class State {
         IDLE,       // Not doing anything
         RUNNING,    // Transcoding is in progress
@@ -56,69 +56,69 @@ class CropAndScale(private val context: Context) {
     val progress = _progress.asStateFlow()
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    @Volatile
     private var transcodeJob: Job? = null
 
     companion object {
         private const val LOG_TAG = "CropAndScale"
         private const val TARGET_LONGEST_SIDE = 512
+        private const val BIT_RATE = 2_000_000
+        private const val MAX_CONSECUTIVE_TIMEOUTS = 3
     }
 
     /**
-     * Starts the video transcoding process.
-     * This function is non-blocking. Observe the `status` and `progress` flows for updates.
-     * @param inputFile The source video file.
-     * @param outputFile The destination for the transcoded MP4 file.
-     * @param startTimeUs The start time for the trim in microseconds. If null, starts from the beginning.
-     * @param endTimeUs The end time for the trim in microseconds. If null, goes to the end.
-     * @param maxFps The maximum frames per second for the output video. If null, uses original FPS.
+     * Starts the transcode; non-blocking.
+     * @return false if a transcode is already running (the request is ignored).
      */
+    @Synchronized
     fun start(
         inputFile: File,
         outputFile: File,
         startTimeUs: Long,
         endTimeUs: Long,
         maxFps: Int
-    ) {
+    ): Boolean {
         if (_status.value == State.RUNNING) {
             Log.w(LOG_TAG, "Transcoding is already in progress. Ignoring new request.")
-            return
+            return false
         }
+        _progress.value = ProgressState()
+        _status.value = State.RUNNING
 
         transcodeJob = scope.launch {
-            _status.value = State.RUNNING
-            _progress.value = ProgressState()
             try {
                 doTranscode(inputFile, outputFile, startTimeUs, endTimeUs, maxFps)
+                _progress.value = _progress.value.copy(
+                    progress = 1f, currentFrame = _progress.value.totalFrames
+                )
                 _status.value = State.SUCCESS
                 Log.d(LOG_TAG, "Transcoding finished successfully.")
             } catch (e: CancellationException) {
+                outputFile.delete()
                 _status.value = State.CANCELLED
                 Log.d(LOG_TAG, "Transcoding was cancelled.")
             } catch (e: Exception) {
+                outputFile.delete()
                 _status.value = State.FAILED
                 Log.e(LOG_TAG, "Transcoding failed with an exception.", e)
-            } finally {
-                val finalState = _progress.value
-                _progress.value =
-                    finalState.copy(progress = 1f, currentFrame = finalState.totalFrames)
             }
         }
+        return true
     }
 
-    /**
-     * Cancels the currently running transcoding job.
-     */
     fun cancel() {
         transcodeJob?.cancel()
     }
 
-    /**
-     * Cleans up resources. Should be called when the transcoder is no longer needed.
-     */
     fun release() {
         scope.cancel()
     }
 
+    /**
+     * Runs the pipeline on a dedicated thread: the EGL context is bound to the thread that
+     * created it, so setup, drawing and teardown must all happen on the same one.
+     */
     private suspend fun doTranscode(
         inputFile: File,
         outputFile: File,
@@ -126,30 +126,48 @@ class CropAndScale(private val context: Context) {
         endTimeUs: Long,
         maxFps: Int
     ) {
+        val glExecutor = Executors.newSingleThreadExecutor()
+        val drainExecutor = Executors.newSingleThreadExecutor()
+        try {
+            withContext(glExecutor.asCoroutineDispatcher()) {
+                transcode(
+                    inputFile, outputFile, startTimeUs, endTimeUs, maxFps,
+                    drainExecutor.asCoroutineDispatcher()
+                )
+            }
+        } finally {
+            glExecutor.shutdown()
+            drainExecutor.shutdown()
+        }
+    }
+
+    private suspend fun transcode(
+        inputFile: File,
+        outputFile: File,
+        startTimeUs: Long,
+        endTimeUs: Long,
+        maxFps: Int,
+        drainDispatcher: CoroutineDispatcher
+    ) {
         val extractor = MediaExtractorCompat(context)
         var decoder: MediaCodec? = null
         var encoder: MediaCodec? = null
         var muxer: MediaMuxer? = null
         val glProcessor = CropScaleGL()
-        val transcoderExecutor = Executors.newSingleThreadExecutor()
+        val muxerStarted = AtomicBoolean(false)
 
         try {
-            extractor.setDataSource(android.net.Uri.fromFile(inputFile), 0L)
-            var videoTrackIndex = -1
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                if (format.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
-                    videoTrackIndex = i
-                    break
-                }
+            extractor.setDataSource(Uri.fromFile(inputFile), 0L)
+            val videoTrackIndex = (0 until extractor.trackCount).indexOfFirst {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)
+                    ?.startsWith("video/") == true
             }
             if (videoTrackIndex == -1) {
                 val mimes = (0 until extractor.trackCount).map {
                     extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)
                 }
                 throw IllegalStateException(
-                    "No video track found (path=${inputFile.absolutePath}, exists=${inputFile.exists()}, " +
-                            "size=${inputFile.length()}, tracks=$mimes)"
+                    "No video track found (size=${inputFile.length()}, tracks=$mimes)"
                 )
             }
 
@@ -162,12 +180,12 @@ class CropAndScale(private val context: Context) {
             } else {
                 endTimeUs
             }
-            val effectiveStartTimeUs = startTimeUs
+            val effectiveStartTimeUs = max(0L, startTimeUs)
             val effectiveEndTimeUs = min(endTimeUs, originalDurationUs)
             val trimmedDurationUs = effectiveEndTimeUs - effectiveStartTimeUs
             if (trimmedDurationUs <= 0) throw IllegalArgumentException("End time must be after start time.")
 
-            extractor.seekTo(effectiveStartTimeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            extractor.seekTo(effectiveStartTimeUs, android.media.MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
             val videoWidth = inputFormat.getInteger(MediaFormat.KEY_WIDTH)
             val videoHeight = inputFormat.getInteger(MediaFormat.KEY_HEIGHT)
@@ -176,11 +194,13 @@ class CropAndScale(private val context: Context) {
                 // MediaExtractorCompat reports the frame rate as a Float.
                 runCatching { inputFormat.getInteger(MediaFormat.KEY_FRAME_RATE) }
                     .getOrElse { inputFormat.getFloat(MediaFormat.KEY_FRAME_RATE).toInt() }
-                    .coerceAtLeast(1)
             } else {
                 24
             }
-            val targetFrameRate = maxFps?.let { min(it, originalFrameRate) } ?: originalFrameRate
+            // The container's KEY_FRAME_RATE is unreliable (a ~57 fps clip reported 15 on a Realme),
+            // so target maxFps: frame dropping never raises the rate of a slower source.
+            val targetFrameRate = maxFps.coerceAtLeast(1)
+            Log.i(LOG_TAG, "Frame rate: reported=$originalFrameRate target=$targetFrameRate")
             val totalFrames = ((trimmedDurationUs / 1_000_000.0) * targetFrameRate).toInt()
             _progress.value = ProgressState(totalFrames = totalFrames)
 
@@ -189,16 +209,8 @@ class CropAndScale(private val context: Context) {
             } else {
                 0
             }
-
-            val rotatedWidth: Int
-            val rotatedHeight: Int
-            if (rotation == 90 || rotation == 270) {
-                rotatedWidth = videoHeight
-                rotatedHeight = videoWidth
-            } else {
-                rotatedWidth = videoWidth
-                rotatedHeight = videoHeight
-            }
+            val rotatedWidth = if (rotation == 90 || rotation == 270) videoHeight else videoWidth
+            val rotatedHeight = if (rotation == 90 || rotation == 270) videoWidth else videoHeight
 
             val outputWidth: Int
             val outputHeight: Int
@@ -211,10 +223,12 @@ class CropAndScale(private val context: Context) {
                 outputWidth =
                     (TARGET_LONGEST_SIDE * (rotatedWidth.toFloat() / rotatedHeight.toFloat())).toInt()
             }
-            val finalOutputWidth = if (outputWidth % 2 == 1) outputWidth - 1 else outputWidth
-            val finalOutputHeight = if (outputHeight % 2 == 1) outputHeight - 1 else outputHeight
+            // H.264 needs even dimensions.
+            val finalOutputWidth = max(2, outputWidth and 1.inv())
+            val finalOutputHeight = max(2, outputHeight and 1.inv())
 
-            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val mux = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = mux
             val outputFormat = MediaFormat.createVideoFormat(
                 MediaFormat.MIMETYPE_VIDEO_AVC, finalOutputWidth, finalOutputHeight
             ).apply {
@@ -222,123 +236,137 @@ class CropAndScale(private val context: Context) {
                     MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
                 )
-                setInteger(MediaFormat.KEY_BIT_RATE, 6_000_000)
+                setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
                 setInteger(MediaFormat.KEY_FRAME_RATE, targetFrameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
-            encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            encoder.configure(outputFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val encoderInputSurface = encoder.createInputSurface()
-            encoder.start()
+            val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            encoder = enc
+            enc.configure(outputFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val encoderInputSurface = enc.createInputSurface()
+            enc.start()
 
             glProcessor.setup(encoderInputSurface, finalOutputWidth, finalOutputHeight)
-            decoder = MediaCodec.createDecoderByType(inputFormat.getString(MediaFormat.KEY_MIME)!!)
-            decoder.configure(inputFormat, glProcessor.decoderInputSurface, null, 0)
-            decoder.start()
+            val dec = MediaCodec.createDecoderByType(inputFormat.getString(MediaFormat.KEY_MIME)!!)
+            decoder = dec
+            dec.configure(inputFormat, glProcessor.decoderInputSurface, null, 0)
+            dec.start()
 
-            var videoTrackMuxerIndex = -1
-            var isMuxerStarted = false
-            val encoderDone = Job()
-            scope.launch(transcoderExecutor.asCoroutineDispatcher()) {
-                val bufferInfo = MediaCodec.BufferInfo()
-                while (isActive) {
-                    val bufferIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000L)
-                    if (bufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        videoTrackMuxerIndex = muxer.addTrack(encoder.outputFormat)
-                        muxer.start()
-                        isMuxerStarted = true
-                    } else if (bufferIndex >= 0) {
-                        if (!isMuxerStarted) throw IllegalStateException("Muxer not started")
-                        val encodedData = encoder.getOutputBuffer(bufferIndex)!!
-                        muxer.writeSampleData(videoTrackMuxerIndex, encodedData, bufferInfo)
-                        encoder.releaseOutputBuffer(bufferIndex, false)
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+            // coroutineScope makes the drain job a child: if it fails, the main loop is
+            // cancelled; if the main loop is cancelled, the drain job stops too.
+            coroutineScope {
+                val drainJob = launch(drainDispatcher) {
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    var trackIndex = -1
+                    while (isActive) {
+                        val index = enc.dequeueOutputBuffer(bufferInfo, 10_000L)
+                        if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            trackIndex = mux.addTrack(enc.outputFormat)
+                            mux.start()
+                            muxerStarted.set(true)
+                        } else if (index >= 0) {
+                            val data = enc.getOutputBuffer(index)!!
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                                bufferInfo.size = 0 // config data is carried by the track format
+                            }
+                            if (bufferInfo.size > 0) {
+                                check(muxerStarted.get()) { "Muxer not started" }
+                                mux.writeSampleData(trackIndex, data, bufferInfo)
+                            }
+                            enc.releaseOutputBuffer(index, false)
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                        }
                     }
                 }
-                encoderDone.complete()
+
+                val decoderBufferInfo = MediaCodec.BufferInfo()
+                var isInputDone = false
+                var isDecoderOutputDone = false
+                var currentFrame = 0
+                var consecutiveTimeouts = 0
+                var lastRenderedTimestampNs = -1L
+                val frameIntervalNs = 1_000_000_000L / targetFrameRate
+
+                while (!isDecoderOutputDone && isActive) {
+                    if (!isInputDone) {
+                        val inputBufferIndex = dec.dequeueInputBuffer(10_000L)
+                        if (inputBufferIndex >= 0) {
+                            val sampleTime = extractor.sampleTime
+                            if (sampleTime < 0 || sampleTime > effectiveEndTimeUs) {
+                                dec.queueInputBuffer(
+                                    inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
+                                isInputDone = true
+                            } else {
+                                val sampleSize = extractor.readSampleData(
+                                    dec.getInputBuffer(inputBufferIndex)!!, 0
+                                )
+                                dec.queueInputBuffer(inputBufferIndex, 0, sampleSize, sampleTime, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+
+                    val outputBufferIndex = dec.dequeueOutputBuffer(decoderBufferInfo, 10_000L)
+                    if (outputBufferIndex >= 0) {
+                        if (decoderBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                            enc.signalEndOfInputStream()
+                            isDecoderOutputDone = true
+                        }
+
+                        val isFrameInRange = decoderBufferInfo.size > 0 &&
+                                decoderBufferInfo.presentationTimeUs >= effectiveStartTimeUs
+
+                        // Frame dropping to honour the target frame rate.
+                        var renderThisFrame = isFrameInRange
+                        if (isFrameInRange) {
+                            val currentTimestampNs = decoderBufferInfo.presentationTimeUs * 1000
+                            if (lastRenderedTimestampNs != -1L &&
+                                currentTimestampNs - lastRenderedTimestampNs < frameIntervalNs
+                            ) {
+                                renderThisFrame = false
+                            } else {
+                                lastRenderedTimestampNs = currentTimestampNs
+                            }
+                        }
+
+                        dec.releaseOutputBuffer(outputBufferIndex, renderThisFrame)
+
+                        if (renderThisFrame) {
+                            try {
+                                glProcessor.awaitNewFrame()
+                                consecutiveTimeouts = 0
+                                val adjustedTimestampUs =
+                                    decoderBufferInfo.presentationTimeUs - effectiveStartTimeUs
+                                glProcessor.drawFrame(adjustedTimestampUs * 1000)
+
+                                currentFrame++
+                                val fraction = (adjustedTimestampUs.toFloat() /
+                                        trimmedDurationUs.toFloat()).coerceIn(0f, 1f)
+                                _progress.value = ProgressState(fraction, currentFrame, totalFrames)
+                            } catch (e: TimeoutException) {
+                                if (++consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) throw e
+                                Log.w(LOG_TAG, "Timeout waiting for frame; the frame was dropped.")
+                            }
+                        }
+                    }
+                }
+                drainJob.join()
             }
 
-            val decoderBufferInfo = MediaCodec.BufferInfo()
-            var isInputDone = false
-            var isDecoderOutputDone = false
-            var currentFrame = 0
-            var lastRenderedTimestampNs = -1L
-            val frameIntervalNs = 1_000_000_000L / targetFrameRate
-
-            while (!isDecoderOutputDone && currentCoroutineContext().isActive) {
-                if (!isInputDone) {
-                    val inputBufferIndex = decoder.dequeueInputBuffer(10000L)
-                    if (inputBufferIndex >= 0) {
-                        val sampleTime = extractor.sampleTime
-                        if (sampleTime < 0 || sampleTime > effectiveEndTimeUs) {
-                            decoder.queueInputBuffer(
-                                inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                            )
-                            isInputDone = true
-                        } else {
-                            val sampleSize = extractor.readSampleData(
-                                decoder.getInputBuffer(inputBufferIndex)!!, 0
-                            )
-                            decoder.queueInputBuffer(
-                                inputBufferIndex, 0, sampleSize, sampleTime, 0
-                            )
-                            extractor.advance()
-                        }
-                    }
-                }
-
-                val outputBufferIndex = decoder.dequeueOutputBuffer(decoderBufferInfo, 10000L)
-                if (outputBufferIndex >= 0) {
-                    if (decoderBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                        encoder.signalEndOfInputStream()
-                        isDecoderOutputDone = true
-                    }
-
-                    val isFrameInRange = decoderBufferInfo.size > 0 &&
-                            decoderBufferInfo.presentationTimeUs >= effectiveStartTimeUs
-
-                    // Frame dropping
-                    var renderThisFrame = isFrameInRange
-                    if (isFrameInRange) {
-                        val currentTimestampNs = decoderBufferInfo.presentationTimeUs * 1000
-                        if (lastRenderedTimestampNs != -1L && currentTimestampNs - lastRenderedTimestampNs < frameIntervalNs) {
-                            renderThisFrame = false
-                        } else {
-                            lastRenderedTimestampNs = currentTimestampNs
-                        }
-                    }
-
-                    decoder.releaseOutputBuffer(outputBufferIndex, renderThisFrame)
-
-                    if (renderThisFrame) {
-                        try {
-                            glProcessor.awaitNewFrame()
-                            val adjustedTimestampUs =
-                                decoderBufferInfo.presentationTimeUs - effectiveStartTimeUs
-                            val timestampNs = adjustedTimestampUs * 1000
-                            glProcessor.drawFrame(timestampNs)
-
-                            currentFrame++
-                            val progressPercentage =
-                                adjustedTimestampUs.toFloat() / trimmedDurationUs.toFloat()
-                            _progress.value =
-                                ProgressState(progressPercentage, currentFrame, totalFrames)
-
-                        } catch (e: TimeoutException) {
-                            Log.w(LOG_TAG, "Timeout waiting for frame.")
-                        }
-                    }
-                }
-            }
-            encoderDone.join()
+            if (!muxerStarted.get()) throw IllegalStateException("No frames were encoded")
+            // Stop explicitly so a failure here is reported instead of leaving a corrupt file.
+            mux.stop()
+            muxerStarted.set(false)
         } finally {
-            // Cleanup must never throw: it would mask the original exception.
             runCatching { extractor.release() }
-            runCatching { decoder?.stop(); decoder?.release() }
-            runCatching { encoder?.stop(); encoder?.release() }
-            runCatching { muxer?.stop(); muxer?.release() }
+            decoder?.let { runCatching { it.stop() }; runCatching { it.release() } }
+            encoder?.let { runCatching { it.stop() }; runCatching { it.release() } }
+            muxer?.let {
+                if (muxerStarted.get()) runCatching { it.stop() }
+                runCatching { it.release() }
+            }
             runCatching { glProcessor.release() }
-            transcoderExecutor.shutdown()
         }
     }
 }

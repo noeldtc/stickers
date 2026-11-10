@@ -1,15 +1,23 @@
 package de.loicezt.stickers.video
 
 import android.graphics.SurfaceTexture
-import android.opengl.*
+import android.opengl.EGL14
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
+import android.opengl.GLES11Ext
+import android.opengl.GLES20
 import android.view.Surface
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
+/**
+ * Renders decoder frames into an encoder input surface. All methods must be called
+ * from the same thread (the one that owns the EGL context).
+ */
 class CropScaleGL : SurfaceTexture.OnFrameAvailableListener {
 
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -20,68 +28,55 @@ class CropScaleGL : SurfaceTexture.OnFrameAvailableListener {
     private var positionHandle = 0
     private var texCoordHandle = 0
     private var transformMatrixHandle = 0
-
     private var videoTextureHandle = 0
 
-    private val vertexBuffer: FloatBuffer
-    private val texCoordBuffer: FloatBuffer
+    private val vertexBuffer: FloatBuffer = GlHelper.floatBuffer(GlHelper.QUAD_VERTICES)
+    private val texCoordBuffer: FloatBuffer = GlHelper.floatBuffer(GlHelper.QUAD_TEX_COORDS)
     private val transformMatrix = FloatArray(16)
 
-    private lateinit var decoderSurfaceTexture: SurfaceTexture
-    lateinit var decoderInputSurface: Surface
-        private set
+    private var decoderSurfaceTexture: SurfaceTexture? = null
+    private var _decoderInputSurface: Surface? = null
+    val decoderInputSurface: Surface
+        get() = _decoderInputSurface ?: throw IllegalStateException("setup() not called")
 
     private val frameSemaphore = Semaphore(0)
 
     private var targetWidth: Int = 0
     private var targetHeight: Int = 0
 
-    init {
-        val vertexData = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
-        vertexBuffer = ByteBuffer.allocateDirect(vertexData.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-        vertexBuffer.put(vertexData).position(0)
-
-        val texCoordData = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
-        texCoordBuffer = ByteBuffer.allocateDirect(texCoordData.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-        texCoordBuffer.put(texCoordData).position(0)
-    }
-
     override fun onFrameAvailable(st: SurfaceTexture?) {
         frameSemaphore.release()
     }
 
     fun setup(encoderSurface: Surface, width: Int, height: Int) {
-        this.targetWidth = width
-        this.targetHeight = height
+        targetWidth = width
+        targetHeight = height
 
-        eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-        val version = IntArray(2)
-        EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
-        val attribList = intArrayOf(EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8, EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT, EGL14.EGL_NONE)
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val numConfigs = IntArray(1)
-        EGL14.eglChooseConfig(eglDisplay, attribList, 0, configs, 0, 1, numConfigs, 0)
+        eglDisplay = GlHelper.initEglDisplay()
+        val config = GlHelper.chooseEglConfig(eglDisplay, pbuffer = false)
         val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
-        eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
-        val surfaceAttribs = intArrayOf(EGL14.EGL_NONE)
-        eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], encoderSurface, surfaceAttribs, 0)
-        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        eglContext = EGL14.eglCreateContext(
+            eglDisplay, config, EGL14.EGL_NO_CONTEXT, contextAttribs, 0
+        )
+        GlHelper.checkEgl("eglCreateContext")
+        eglSurface = EGL14.eglCreateWindowSurface(
+            eglDisplay, config, encoderSurface, intArrayOf(EGL14.EGL_NONE), 0
+        )
+        GlHelper.checkEgl("eglCreateWindowSurface")
+        if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+            GlHelper.checkEgl("eglMakeCurrent")
+        }
 
-        programHandle = createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+        programHandle = GlHelper.createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         positionHandle = GLES20.glGetAttribLocation(programHandle, "aPosition")
         texCoordHandle = GLES20.glGetAttribLocation(programHandle, "aTexCoord")
         transformMatrixHandle = GLES20.glGetUniformLocation(programHandle, "uTransformMatrix")
 
-        val textures = IntArray(1)
-        GLES20.glGenTextures(1, textures, 0)
-        videoTextureHandle = textures[0]
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureHandle)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-
-        decoderSurfaceTexture = SurfaceTexture(videoTextureHandle)
-        decoderSurfaceTexture.setOnFrameAvailableListener(this)
-        decoderInputSurface = Surface(decoderSurfaceTexture)
+        videoTextureHandle = GlHelper.createExternalOesTexture()
+        val texture = SurfaceTexture(videoTextureHandle)
+        texture.setOnFrameAvailableListener(this)
+        decoderSurfaceTexture = texture
+        _decoderInputSurface = Surface(texture)
     }
 
     fun awaitNewFrame() {
@@ -91,8 +86,9 @@ class CropScaleGL : SurfaceTexture.OnFrameAvailableListener {
     }
 
     fun drawFrame(timestampNs: Long) {
-        decoderSurfaceTexture.updateTexImage()
-        decoderSurfaceTexture.getTransformMatrix(transformMatrix)
+        val texture = decoderSurfaceTexture ?: throw IllegalStateException("setup() not called")
+        texture.updateTexImage()
+        texture.getTransformMatrix(transformMatrix)
 
         GLES20.glViewport(0, 0, targetWidth, targetHeight)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -114,33 +110,24 @@ class CropScaleGL : SurfaceTexture.OnFrameAvailableListener {
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
     }
 
+    /** Safe to call even if [setup] failed halfway, and more than once. */
     fun release() {
-        // May be called after a failed/partial setup(), so guard every resource.
-        if (::decoderInputSurface.isInitialized) decoderInputSurface.release()
-        if (::decoderSurfaceTexture.isInitialized) decoderSurfaceTexture.release()
+        _decoderInputSurface?.release()
+        _decoderInputSurface = null
+        decoderSurfaceTexture?.release()
+        decoderSurfaceTexture = null
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
-            EGL14.eglDestroySurface(eglDisplay, eglSurface)
-            EGL14.eglDestroyContext(eglDisplay, eglContext)
+            EGL14.eglMakeCurrent(
+                eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT
+            )
+            if (eglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(eglDisplay, eglSurface)
+            if (eglContext != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(eglDisplay, eglContext)
             EGL14.eglReleaseThread()
             EGL14.eglTerminate(eglDisplay)
         }
-    }
-
-    private fun createProgram(vertexSource: String, fragmentSource: String): Int {
-        val vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, vertexSource)
-        val fragmentShader = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource)
-        val program = GLES20.glCreateProgram()
-        GLES20.glAttachShader(program, vertexShader)
-        GLES20.glAttachShader(program, fragmentShader)
-        GLES20.glLinkProgram(program)
-        return program
-    }
-
-    private fun loadShader(type: Int, source: String): Int {
-        val shader = GLES20.glCreateShader(type)
-        GLES20.glShaderSource(shader, source)
-        GLES20.glCompileShader(shader)
-        return shader
+        eglDisplay = EGL14.EGL_NO_DISPLAY
+        eglContext = EGL14.EGL_NO_CONTEXT
+        eglSurface = EGL14.EGL_NO_SURFACE
     }
 
     private val VERTEX_SHADER = """
@@ -164,4 +151,3 @@ class CropScaleGL : SurfaceTexture.OnFrameAvailableListener {
         }
     """.trimIndent()
 }
-
