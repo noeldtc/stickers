@@ -1,7 +1,9 @@
 package de.loicezt.stickers
 
 import android.os.SystemClock
+import android.util.Log
 import de.loicezt.stickers.video.CropAndScale
+import de.loicezt.stickers.video.FramesToVideo
 import de.loicezt.stickers.video.OverlayAndEncode
 import de.loicezt.stickers.video.ProgressState
 import de.loicezt.stickers.video.WebPConfig
@@ -29,6 +31,8 @@ class MainActivity : FlutterActivity() {
 
     private lateinit var cropAndScale: CropAndScale
     private lateinit var overlayAndEncode: OverlayAndEncode
+    private val framesToVideo = FramesToVideo()
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -85,6 +89,23 @@ class MainActivity : FlutterActivity() {
                     "cancelTrim" -> {
                         cropAndScale.cancel()
                         result.success(null)
+                    }
+
+                    "framesToVideo" -> {
+                        // GIF / animated WebP frames (already decoded to PNG by Dart) -> MP4.
+                        val framesDir = call.stringArg("framesDir")
+                        val outputFile = call.stringArg("outputFile")
+                        val durations = call.argument<List<*>>("durationsMs")?.map { (it as Number).toInt() }
+                            ?: throw IllegalArgumentException("Missing argument 'durationsMs'")
+                        scope.launch {
+                            try {
+                                framesToVideo.run(File(framesDir), File(outputFile), durations)
+                                result.success(null)
+                            } catch (e: Exception) {
+                                Log.e("FramesToVideo", "Conversion failed", e)
+                                result.error("FRAMES_TO_VIDEO_FAILED", e.message, null)
+                            }
+                        }
                     }
 
                     else -> result.notImplemented()
@@ -163,5 +184,6 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
         if (this::cropAndScale.isInitialized) cropAndScale.release()
         if (this::overlayAndEncode.isInitialized) overlayAndEncode.release()
+        scope.cancel()
     }
 }

@@ -76,11 +76,19 @@ class _EditPageState extends State<EditPage> {
       _controller.setLooping(true);
       _controller.setVolume(0);
       _controller.initialize().then((_) {
+        if (!mounted) return;
         _controller.play();
         setState(() {});
       });
     }
     //_sticker = _pack.stickers[widget.index];
+  }
+
+  @override
+  void dispose() {
+    // The video player was never released before: it kept decoding after leaving the editor.
+    if (widget.mediaType == MediaType.video) _controller.dispose();
+    super.dispose();
   }
 
   final GlobalKey _rbKey = GlobalKey();
@@ -111,8 +119,8 @@ class _EditPageState extends State<EditPage> {
           child: LayoutBuilder(builder: (context, constraints) {
             final isHorizontal = constraints.maxWidth > constraints.maxHeight;
             final double buttonSize = isHorizontal
-                ? (min(constraints.maxHeight - 48, 500 - 12)) / (colors.length / 2)
-                : min(constraints.maxWidth - 48, 500) / (colors.length / 2);
+                ? (min(constraints.maxHeight - 48, 500 - 12)) / (colors.length / 2).ceil()
+                : min(constraints.maxWidth - 48, 500) / (colors.length / 2).ceil();
 
             final colorButtons = AnimatedCrossFade(
                 sizeCurve: _curve,
@@ -136,7 +144,7 @@ class _EditPageState extends State<EditPage> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: colors
-                          .getRange((colors.length / 2).floor() + 1, colors.length)
+                          .getRange((colors.length / 2).floor(), colors.length)
                           .map((c) => ColorButton(
                                 c,
                                 size: buttonSize,
@@ -514,7 +522,7 @@ class _EditPageState extends State<EditPage> {
 
       final Uint8List data;
       if (widget.mediaType == MediaType.picture) {
-        data = (await ImageEditor.editFileImage(file: _source, imageEditorOption: option))!;
+        data = await _exportStaticSticker(option);
       } else {
         data = await exportAnimatedSticker(option, context);
       }
@@ -543,18 +551,43 @@ class _EditPageState extends State<EditPage> {
         text.outlineWidth *= scaleFactor;
         text.fontSize /= FontsRegistry.sizeMultiplier(text.fontName) ?? 1;
       }
-      setState(() {
-        _exporting = false;
-      });
+      if (mounted) {
+        setState(() {
+          _exporting = false;
+          // Without this the "Exporting" overlay stayed on top of the editor after a failure.
+          _message = null;
+          _exportProgress = null;
+        });
+      }
     }
     return;
   }
 
+  /// WhatsApp rejects static stickers over 100 kB, so lower the quality until it fits.
+  Future<Uint8List> _exportStaticSticker(ImageEditorOption option) async {
+    Uint8List? data;
+    for (final quality in const [90, 75, 60, 45, 30]) {
+      option.outputFormat = OutputFormat.webp_lossy(quality);
+      data = (await ImageEditor.editFileImage(file: _source, imageEditorOption: option))!;
+      if (data.lengthInBytes <= 100 * 1024) break;
+    }
+    return data!;
+  }
+
   Future<Uint8List> exportAnimatedSticker(ImageEditorOption option, BuildContext context) async {
+    final service = OverlayAndEncodeService();
+    try {
+      return await _exportAnimatedSticker(option, context, service);
+    } finally {
+      service.dispose();
+    }
+  }
+
+  Future<Uint8List> _exportAnimatedSticker(
+      ImageEditorOption option, BuildContext context, OverlayAndEncodeService service) async {
     final transparent = await rootBundle.load("assets/transparent.webp");
     final out =
         await ImageEditor.editImageAndGetFile(image: transparent.buffer.asUint8List(), imageEditorOption: option);
-    final service = OverlayAndEncodeService();
     final output = File("$mediaCacheDir/exported_${DateTime.now().millisecondsSinceEpoch}.webp");
     Stopwatch sw = Stopwatch()..start();
     Uint8List? data;
@@ -587,18 +620,11 @@ class _EditPageState extends State<EditPage> {
         } else if (update.status == Status.RUNNING) {
           _exportProgress = update.progress;
           setState(() {});
-        } else if (update.status == Status.FAILED) {
-          if (context.mounted) {
-            showDialog(
-              context: context,
-              builder: (context) {
-                return ErrorDialog(
-                  title: AppLocalizations.of(context)!.exportWebpFailed,
-                  message: AppLocalizations.of(context)!.exportWebpFailedMsg,
-                );
-              },
-            );
-          }
+        } else if (update.status == Status.FAILED || update.status == Status.CANCELLED) {
+          // Used to only show a dialog and keep waiting forever for a SUCCESS that never comes,
+          // leaving the editor stuck on "Exporting".
+          throw Exception(
+              context.mounted ? AppLocalizations.of(context)!.exportWebpFailedMsg : "WebP export failed");
         }
       }
       print("Exported WebP in ${sw.elapsedMilliseconds}ms");

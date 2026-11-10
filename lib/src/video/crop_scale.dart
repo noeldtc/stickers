@@ -14,8 +14,10 @@ class CropAndScaleService {
 
   CropAndScaleService() {
     // Listen to the native event channel as soon as the service is created
-    _eventChannel.receiveBroadcastStream().listen(_onProgress, onError: _onError);
+    _subscription = _eventChannel.receiveBroadcastStream().listen(_onProgress, onError: _onError);
   }
+
+  late final StreamSubscription<dynamic> _subscription;
 
   void _onProgress(dynamic data) {
     if (data is Map) {
@@ -40,7 +42,8 @@ class CropAndScaleService {
     _progressController.add(Progress(status: Status.FAILED));
   }
 
-  Future<void> start({
+  /// Returns false if the native side refused to start (nothing will be reported on the stream then).
+  Future<bool> start({
     required String inputFile,
     required String outputFile,
     required Duration start,
@@ -53,8 +56,10 @@ class CropAndScaleService {
         'startTimeUs': start.inMicroseconds.toString(),
         'endTimeUs': end.inMicroseconds.toString(),
       });
+      return true;
     } on PlatformException catch (e) {
       print("Failed to start transcoding: '${e.message}'.");
+      return false;
     }
   }
 
@@ -67,6 +72,7 @@ class CropAndScaleService {
   }
 
   void dispose() {
+    _subscription.cancel();
     _progressController.close();
   }
 }

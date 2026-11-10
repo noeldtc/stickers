@@ -16,8 +16,10 @@ class OverlayAndEncodeService {
 
   OverlayAndEncodeService() {
     // Listen to the native event channel as soon as the service is created.
-    _eventChannel.receiveBroadcastStream().listen(_onProgress, onError: _onError);
+    _subscription = _eventChannel.receiveBroadcastStream().listen(_onProgress, onError: _onError);
   }
+
+  late final StreamSubscription<dynamic> _subscription;
 
   /// Handles incoming data from the native EventChannel.
   void _onProgress(dynamic data) {
@@ -78,7 +80,8 @@ class OverlayAndEncodeService {
   /// Calls the native method to cancel the ongoing process.
   Future<void> cancel() async {
     try {
-      await _methodChannel.invokeMethod('cancel');
+      // Must match the handler name in MainActivity.kt ("cancel" is not handled there).
+      await _methodChannel.invokeMethod('cancelOverlay');
     } on PlatformException catch (e) {
       // ignore: avoid_print
       print("Failed to cancel overlay process: '${e.message}'.");
@@ -87,6 +90,8 @@ class OverlayAndEncodeService {
 
   /// Cleans up the stream controller.
   void dispose() {
+    // Stop listening first: a late native event would otherwise be added to a closed controller.
+    _subscription.cancel();
     _progressController.close();
   }
 }

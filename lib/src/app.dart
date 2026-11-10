@@ -8,6 +8,7 @@ import 'package:stickers/src/data/load_store.dart';
 import 'package:stickers/src/data/sticker_pack.dart';
 import 'package:stickers/src/dialogs/error_dialog.dart';
 import 'package:stickers/src/globals.dart';
+import 'package:stickers/src/media_kind.dart';
 import 'package:stickers/src/pages/crop_page.dart';
 import 'package:stickers/src/pages/edit_page.dart';
 import 'package:stickers/src/pages/fonts_manager_page.dart';
@@ -216,7 +217,8 @@ class StickersAppState extends State<StickersApp> {
       }
       return;
     }
-    if (media.attachments == null || media.attachments!.isEmpty) return;
+    // Shares without any file (plain text, ...) have nothing for us.
+    if (media.attachments == null || media.attachments!.isEmpty || media.attachments!.first == null) return;
     if (media.attachments!.first!.path.toLowerCase().endsWith(".stickify") ||
         media.attachments!.first!.path.toLowerCase().endsWith(".zip") ||
         media.attachments!.first!.path.toLowerCase().endsWith(".wastickers")) {
@@ -235,7 +237,9 @@ class StickersAppState extends State<StickersApp> {
       }
       return;
     }
-    if (media.attachments!.first!.type != SharedAttachmentType.image) {
+    // Any image, GIF or video is welcome; the file content decides, not the MIME type the sender claimed.
+    final kind = await detectMediaKind(media.attachments!.first!.path);
+    if (kind == MediaKind.unknown) {
       if (mounted) {
         showDialog(
             context: navigatorKey.currentState!.context,
@@ -247,7 +251,8 @@ class StickersAppState extends State<StickersApp> {
       return;
     }
     this.media = media;
-    if (widget.settingsController.quickMode) {
+    // Quick mode only knows how to make static stickers; animated media goes through the pack selector.
+    if (widget.settingsController.quickMode && kind == MediaKind.image) {
       _quickAdd(media, widget.settingsController.defaultTitle, widget.settingsController.defaultAuthor);
       this.media = null;
     }

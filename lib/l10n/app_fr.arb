@@ -124,5 +124,11 @@
   "trimFailedMsg": "Essayez une autre vidéo, et si cela ne fonctionne toujours pas, rendez-vous sur GitHub pour signaler un problème",
   "fontsManagerDetails": "Ajouter/supprimer des polices de l'application",
   "clearCache": "Vider le cache",
-  "thisWillRestart": "Ceci redémarrera l'application"
+  "thisWillRestart": "Ceci redémarrera l'application",
+  "otherPackTypeNeeded": "Un autre type de pack est nécessaire",
+  "needsAnimatedPack": "C'est une vidéo ou une animation : il faut un pack animé. Elle sera ajoutée à « {pack} ».",
+  "needsStaticPack": "C'est une image fixe : il faut un pack statique. Elle sera ajoutée à « {pack} ».",
+  "convertingMedia": "Conversion de l'animation…",
+  "unsupportedMedia": "Ce fichier n'est pas une image, un GIF ou une vidéo convertible en sticker.",
+  "conversionFailed": "Impossible de convertir l'animation"
 }

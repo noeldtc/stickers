@@ -127,5 +127,11 @@
   "trimFailedMsg": "Try another video, and if it still doesn't work, head to GitHub to submit an Issue",
   "fontsManagerDetails": "Add/remove fonts of the app",
   "clearCache": "Clear cache",
-  "thisWillRestart": "This will restart the app"
+  "thisWillRestart": "This will restart the app",
+  "otherPackTypeNeeded": "A different pack type is needed",
+  "needsAnimatedPack": "This is a video or an animation, so it needs an animated pack. It will be added to “{pack}”.",
+  "needsStaticPack": "This is a still picture, so it needs a static pack. It will be added to “{pack}”.",
+  "convertingMedia": "Converting animation…",
+  "unsupportedMedia": "This file isn't a picture, GIF or video that can be turned into a sticker.",
+  "conversionFailed": "Couldn't convert the animation"
 }

@@ -12,7 +12,7 @@ import 'package:stickers/src/dialogs/edit_pack_dialog.dart';
 import 'package:stickers/src/dialogs/edit_sticker_dialog.dart';
 import 'package:stickers/src/dialogs/error_dialog.dart';
 import 'package:stickers/src/globals.dart';
-import 'package:stickers/src/pages/crop_page.dart';
+import 'package:stickers/src/media_router.dart';
 import 'package:stickers/src/pages/default_page.dart';
 import 'package:stickers/src/util.dart';
 
@@ -193,34 +193,17 @@ class StickerPackPageState extends State<StickerPackPage> {
 
   Future<void> _createSticker(int index) async {
     try {
-      final ImagePicker picker = ImagePicker();
-      if (widget.pack.animated) {
-        final XFile? video = await picker.pickVideo(source: ImageSource.gallery);
-        if (video == null) return;
-        if (!mounted) return;
-        Navigator.pushNamed(
-          context,
-          "/crop_video",
-          arguments: EditArguments(
-            pack: widget.pack,
-            index: index,
-            mediaPath: video.path,
-          ),
-        ).then((value) => setState(() {}));
-      } else {
-        final XFile? image = await picker.pickImage(source: ImageSource.gallery);
-        if (image == null) return; //TODO add Snackbar warning
-        if (!mounted) return;
-        Navigator.pushNamed(
-          context,
-          "/crop",
-          arguments: EditArguments(
-            pack: widget.pack,
-            index: index,
-            mediaPath: image.path,
-          ),
-        ).then((value) => setState(() {}));
+      // Images, GIFs and videos alike: the router picks the right pipeline and pack type.
+      final XFile? media = await ImagePicker().pickMedia();
+      if (media == null) return;
+      if (!mounted) return;
+      final target = await addMediaToPack(context, widget.pack, media.path);
+      if (target != null && target != widget.pack) {
+        // The media needed another type of pack: show where it ended up.
+        homeState?.update();
+        navigatorKey.currentState?.pushNamed(StickerPackPage.routeName, arguments: target);
       }
+      if (mounted) setState(() {});
     } on Exception catch (e) {
       if (mounted) {
         showDialog(

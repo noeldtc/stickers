@@ -56,20 +56,21 @@ class _VideoCropPageState extends State<VideoCropPage> with TickerProviderStateM
       viewType: VideoViewType.platformView,
       videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
     );
-    _controller.initialize().onError((e, st) {
-      if (mounted) {
-        showDialog(
-            context: context,
-            builder: (context) {
-              return ErrorDialog(
-                title: AppLocalizations.of(context)!.couldntLoadVideo,
-                message: e.toString(),
-              );
-            }).then(Navigator.of(context).pop);
-      }
-    }).then((_) => setState(() {
-          _ready = true;
-        }));
+    _controller.initialize().then((_) {
+      if (mounted) setState(() => _ready = true);
+    }, onError: (Object e, StackTrace st) {
+      if (!mounted) return;
+      showDialog(
+          context: context,
+          builder: (context) {
+            return ErrorDialog(
+              title: AppLocalizations.of(context)!.couldntLoadVideo,
+              message: e.toString(),
+            );
+          }).then((_) {
+        if (mounted) Navigator.of(context).pop();
+      });
+    });
     _controller.addListener(_videoListener);
     _controller.setVolume(0);
   }
@@ -92,6 +93,7 @@ class _VideoCropPageState extends State<VideoCropPage> with TickerProviderStateM
     _maskColorController.removeListener(_animationListener);
     _maskColorController.dispose();
     _controller.dispose();
+    service.dispose();
   }
 
   @override
@@ -275,28 +277,33 @@ class _VideoCropPageState extends State<VideoCropPage> with TickerProviderStateM
     try {
       _controller.pause();
       final output = "$mediaCacheDir/import_${DateTime.now().millisecondsSinceEpoch}.mp4";
-      await service.start(
+      final started = await service.start(
         inputFile: widget.imagePath,
         outputFile: output,
         start: _controller.value.duration * _range.start,
         end: _controller.value.duration * _range.end,
       );
-      await for (final s in service.progressStream) {
-        if (s.status == Status.SUCCESS) {
-          break;
-        } else if (s.status == Status.FAILED) {
-          print("Transcoding failed!");
-          if (mounted) {
-            showDialog(
-                context: context,
-                builder: (context) {
-                  return ErrorDialog(
-                      title: AppLocalizations.of(context)!.trimFailed,
-                      message: AppLocalizations.of(context)!.trimFailedMsg);
-                });
+      Status? result = started ? null : Status.FAILED;
+      if (started) {
+        await for (final s in service.progressStream) {
+          if (s.status == Status.SUCCESS || s.status == Status.FAILED || s.status == Status.CANCELLED) {
+            result = s.status;
+            break;
           }
-          throw Exception();
         }
+      }
+      if (result != Status.SUCCESS) {
+        print("Transcoding failed!");
+        if (mounted) {
+          showDialog(
+              context: context,
+              builder: (context) {
+                return ErrorDialog(
+                    title: AppLocalizations.of(context)!.trimFailed,
+                    message: AppLocalizations.of(context)!.trimFailedMsg);
+              });
+        }
+        return;
       }
       if (!mounted) return;
       Navigator.of(context).pushNamed("/edit",
@@ -307,9 +314,11 @@ class _VideoCropPageState extends State<VideoCropPage> with TickerProviderStateM
             type: MediaType.video,
           ));
     } finally {
-      setState(() {
-        _exporting = false;
-      });
+      if (mounted) {
+        setState(() {
+          _exporting = false;
+        });
+      }
     }
   }
 }
