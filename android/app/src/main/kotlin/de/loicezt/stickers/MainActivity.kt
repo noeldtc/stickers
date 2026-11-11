@@ -1,5 +1,7 @@
 package de.loicezt.stickers
 
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.os.SystemClock
 import android.util.Log
 import de.loicezt.stickers.video.CropAndScale
@@ -19,7 +21,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : FlutterActivity() {
     private val METHOD_CHANNEL_NAME = "de.loicezt.stickers/methods"
@@ -68,11 +72,12 @@ class MainActivity : FlutterActivity() {
                         val config = call.argument<Map<*, *>>("config")
                             ?: throw IllegalArgumentException("Missing argument 'config'")
                         val fps = call.longArg("fps").toInt()
+                        val fitMode = call.argument<String>("fitMode") ?: "fit"
                         require(videoFile.isFile) { "Video file does not exist: ${videoFile.path}" }
                         require(overlayFile.isFile) { "Overlay file does not exist: ${overlayFile.path}" }
                         require(fps > 0) { "fps must be positive." }
                         if (overlayAndEncode.start(
-                                videoFile, overlayFile, outputFile, WebPConfig.fromMap(config), fps
+                                videoFile, overlayFile, outputFile, WebPConfig.fromMap(config), fps, fitMode
                             )
                         ) {
                             result.success(null)
@@ -104,6 +109,39 @@ class MainActivity : FlutterActivity() {
                             } catch (e: Exception) {
                                 Log.e("FramesToVideo", "Conversion failed", e)
                                 result.error("FRAMES_TO_VIDEO_FAILED", e.message, null)
+                            }
+                        }
+                    }
+
+                    "extractVideoFrame" -> {
+                        val inputFile = File(call.stringArg("inputFile"))
+                        val outputFile = File(call.stringArg("outputFile"))
+                        val timeUs = call.longArg("timeUs")
+                        require(inputFile.isFile) { "Input file does not exist: ${inputFile.path}" }
+                        scope.launch(Dispatchers.IO) {
+                            val retriever = MediaMetadataRetriever()
+                            try {
+                                retriever.setDataSource(inputFile.absolutePath)
+                                val bitmap = retriever.getFrameAtTime(
+                                    timeUs,
+                                    MediaMetadataRetriever.OPTION_CLOSEST
+                                ) ?: throw IllegalStateException("Could not extract frame at $timeUs us")
+                                outputFile.parentFile?.mkdirs()
+                                val fos = FileOutputStream(outputFile)
+                                bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                                fos.flush()
+                                fos.close()
+                                bitmap.recycle()
+                                withContext(Dispatchers.Main) {
+                                    result.success(outputFile.absolutePath)
+                                }
+                            } catch (e: Exception) {
+                                Log.e("MainActivity", "Frame extraction failed", e)
+                                withContext(Dispatchers.Main) {
+                                    result.error("EXTRACT_FRAME_FAILED", e.message, null)
+                                }
+                            } finally {
+                                runCatching { retriever.release() }
                             }
                         }
                     }

@@ -133,5 +133,10 @@
   "needsStaticPack": "This is a still picture, so it needs a static pack. It will be added to “{pack}”.",
   "convertingMedia": "Converting animation…",
   "unsupportedMedia": "This file isn't a picture, GIF or video that can be turned into a sticker.",
-  "conversionFailed": "Couldn't convert the animation"
+  "conversionFailed": "Couldn't convert the animation",
+  "fitMode": "Fit",
+  "fillMode": "Fill 1:1",
+  "captureFrame": "Static frame",
+  "captureFrameTooltip": "Capture still frame as static sticker",
+  "configureSticker": "Configure sticker"
 }

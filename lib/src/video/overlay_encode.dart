@@ -56,6 +56,7 @@ class OverlayAndEncodeService {
     required String outputFile,
     required WebPConfig config,
     required int fps,
+    String fitMode = 'fit',
   }) async {
     try {
       // The method name 'startOverlay' and the argument keys must match
@@ -67,6 +68,7 @@ class OverlayAndEncodeService {
           'overlayFile': overlayFile,
           'outputFile': outputFile,
           'fps': fps,
+          'fitMode': fitMode,
           'config': config.toMap(),
         },
       );

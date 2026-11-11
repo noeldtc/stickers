@@ -66,7 +66,8 @@ class OverlayAndEncode {
         overlayFile: File,
         outputFile: File,
         config: WebPConfig,
-        maxFps: Int
+        maxFps: Int,
+        fitMode: String = "fit"
     ): Boolean {
         if (_status.value == State.RUNNING) {
             Log.w(LOG_TAG, "Encoding is already in progress. Ignoring new request.")
@@ -79,7 +80,7 @@ class OverlayAndEncode {
             // Write to a temp file and rename, so a failure never leaves a partial output.
             val tempFile = File(outputFile.path + ".tmp")
             try {
-                val webpData = doOverlayAndEncode(videoFile, overlayFile, config, maxFps)
+                val webpData = doOverlayAndEncode(videoFile, overlayFile, config, maxFps, fitMode)
                     ?: throw IllegalStateException("Encoding produced no data.")
                 tempFile.writeBytes(webpData)
                 if (!tempFile.renameTo(outputFile)) {
@@ -122,12 +123,13 @@ class OverlayAndEncode {
         videoFile: File,
         overlayFile: File,
         config: WebPConfig,
-        maxFps: Int
+        maxFps: Int,
+        fitMode: String = "fit"
     ): ByteArray? {
         val executor = Executors.newSingleThreadExecutor()
         try {
             return withContext(executor.asCoroutineDispatcher()) {
-                encode(videoFile, overlayFile, config, maxFps)
+                encode(videoFile, overlayFile, config, maxFps, fitMode)
             }
         } finally {
             executor.shutdown()
@@ -138,7 +140,8 @@ class OverlayAndEncode {
         videoFile: File,
         overlayFile: File,
         config: WebPConfig,
-        maxFps: Int
+        maxFps: Int,
+        fitMode: String = "fit"
     ): ByteArray? {
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
@@ -202,7 +205,7 @@ class OverlayAndEncode {
 
                 glProcessor.setup(
                     OUTPUT_DIMENSION, OUTPUT_DIMENSION, videoWidth, videoHeight, rotation,
-                    overlayBitmap
+                    overlayBitmap, fitMode
                 )
             } finally {
                 overlayBitmap.recycle()

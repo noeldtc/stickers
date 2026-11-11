@@ -58,6 +58,7 @@ class _CropPageState extends State<CropPage> with TickerProviderStateMixin {
   }
 
   double? _aspectRatio;
+  CropShape _shape = CropShape.rectangle;
 
   @override
   Widget build(BuildContext context) {
@@ -143,72 +144,108 @@ class _CropPageState extends State<CropPage> with TickerProviderStateMixin {
                 SizedBox(height: 4),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                  child: SegmentedButton<double>(
+                  child: SegmentedButton<CropShape>(
                     showSelectedIcon: false,
-                    emptySelectionAllowed: true,
-                    multiSelectionEnabled: false,
-                    segments: [
+                    segments: const [
                       ButtonSegment(
-                          value: 16 / 9,
-                          icon: Column(children: [
-                            Icon(Icons.crop_16_9),
-                            Text(
-                              "16:9",
-                              style: TextStyle(fontSize: 10),
-                            )
-                          ])),
+                        value: CropShape.rectangle,
+                        icon: Icon(Icons.crop_square, size: 16),
+                        label: Text("Rectángulo", style: TextStyle(fontSize: 11)),
+                      ),
                       ButtonSegment(
-                          value: 3 / 2,
-                          icon: Column(children: [
-                            Icon(Icons.crop_3_2),
-                            Text(
-                              "3:2",
-                              style: TextStyle(fontSize: 10),
-                            )
-                          ])),
+                        value: CropShape.circle,
+                        icon: Icon(Icons.circle_outlined, size: 16),
+                        label: Text("Círculo", style: TextStyle(fontSize: 11)),
+                      ),
                       ButtonSegment(
-                          value: 1,
-                          icon: Column(children: [
-                            Icon(Icons.crop_din),
-                            Text(
-                              "1:1",
-                              style: TextStyle(fontSize: 10),
-                            )
-                          ])),
-                      ButtonSegment(
-                          value: 2 / 3,
-                          icon: Column(children: [
-                            Transform.rotate(
-                              angle: pi / 2,
-                              child: Icon(Icons.crop_3_2),
-                            ),
-                            Text(
-                              "2:3",
-                              style: TextStyle(fontSize: 10),
-                            )
-                          ])),
-                      ButtonSegment(
-                          value: 9 / 16,
-                          icon: Column(children: [
-                            Transform.rotate(
-                              angle: pi / 2,
-                              child: Icon(Icons.crop_16_9),
-                            ),
-                            Text(
-                              "9:16",
-                              style: TextStyle(fontSize: 10),
-                            )
-                          ])),
+                        value: CropShape.roundedRect,
+                        icon: Icon(Icons.rounded_corner, size: 16),
+                        label: Text("Redondeado", style: TextStyle(fontSize: 11)),
+                      ),
                     ],
-                    selected: {_aspectRatio == null ? 0 : _aspectRatio!},
-                    onSelectionChanged: (v) {
+                    selected: {_shape},
+                    onSelectionChanged: (set) {
                       setState(() {
-                        _aspectRatio = v.firstOrNull;
+                        _shape = set.first;
+                        if (_shape == CropShape.circle) {
+                          _aspectRatio = 1.0;
+                        }
                         HapticFeedback.lightImpact();
                       });
                     },
                   ),
                 ),
+                if (_shape != CropShape.circle) ...[
+                  SizedBox(height: 4),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                    child: SegmentedButton<double>(
+                      showSelectedIcon: false,
+                      emptySelectionAllowed: true,
+                      multiSelectionEnabled: false,
+                      segments: [
+                        ButtonSegment(
+                            value: 16 / 9,
+                            icon: Column(children: [
+                              Icon(Icons.crop_16_9),
+                              Text(
+                                "16:9",
+                                style: TextStyle(fontSize: 10),
+                              )
+                            ])),
+                        ButtonSegment(
+                            value: 3 / 2,
+                            icon: Column(children: [
+                              Icon(Icons.crop_3_2),
+                              Text(
+                                "3:2",
+                                style: TextStyle(fontSize: 10),
+                              )
+                            ])),
+                        ButtonSegment(
+                            value: 1,
+                            icon: Column(children: [
+                              Icon(Icons.crop_din),
+                              Text(
+                                "1:1",
+                                style: TextStyle(fontSize: 10),
+                              )
+                            ])),
+                        ButtonSegment(
+                            value: 2 / 3,
+                            icon: Column(children: [
+                              Transform.rotate(
+                                angle: pi / 2,
+                                child: Icon(Icons.crop_3_2),
+                              ),
+                              Text(
+                                "2:3",
+                                style: TextStyle(fontSize: 10),
+                              )
+                            ])),
+                        ButtonSegment(
+                            value: 9 / 16,
+                            icon: Column(children: [
+                              Transform.rotate(
+                                angle: pi / 2,
+                                child: Icon(Icons.crop_16_9),
+                              ),
+                              Text(
+                                "9:16",
+                                style: TextStyle(fontSize: 10),
+                              )
+                            ])),
+                      ],
+                      selected: {_aspectRatio == null ? 0 : _aspectRatio!},
+                      onSelectionChanged: (v) {
+                        setState(() {
+                          _aspectRatio = v.firstOrNull;
+                          HapticFeedback.lightImpact();
+                        });
+                      },
+                    ),
+                  ),
+                ],
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -240,7 +277,8 @@ class _CropPageState extends State<CropPage> with TickerProviderStateMixin {
                               state.rawImageData,
                               widget.pack,
                               widget.index,
-                              _editorController.rotateDegrees);
+                              _editorController.rotateDegrees,
+                              shape: _shape);
                           final output = await saveTemp(cropped);
                           if (!context.mounted) return;
                           Navigator.of(context).pushNamed(
@@ -278,10 +316,13 @@ class EditArguments {
   int index;
   String mediaPath;
   MediaType type;
+  String fitMode;
 
-  EditArguments(
-      {required this.pack,
-      required this.index,
-      required this.mediaPath,
-      this.type = MediaType.picture});
+  EditArguments({
+    required this.pack,
+    required this.index,
+    required this.mediaPath,
+    this.type = MediaType.picture,
+    this.fitMode = 'fit',
+  });
 }
