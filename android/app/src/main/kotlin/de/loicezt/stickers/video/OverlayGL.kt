@@ -100,14 +100,15 @@ class OverlayGL : SurfaceTexture.OnFrameAvailableListener {
         videoWidth: Int,
         videoHeight: Int,
         rotationDegrees: Int,
-        overlayBitmap: Bitmap
+        overlayBitmap: Bitmap,
+        fitMode: String = "fit"
     ) {
         this.outputWidth = outputWidth
         this.outputHeight = outputHeight
         if (rotationDegrees == 90 || rotationDegrees == 270) {
-            calculateViewport(videoHeight, videoWidth)
+            calculateViewport(videoHeight, videoWidth, fitMode)
         } else {
-            calculateViewport(videoWidth, videoHeight)
+            calculateViewport(videoWidth, videoHeight, fitMode)
         }
 
         eglDisplay = GlHelper.initEglDisplay()
@@ -158,18 +159,34 @@ class OverlayGL : SurfaceTexture.OnFrameAvailableListener {
         return context
     }
 
-    private fun calculateViewport(videoWidth: Int, videoHeight: Int) {
+    private fun calculateViewport(videoWidth: Int, videoHeight: Int, fitMode: String = "fit") {
         val videoAspect = videoWidth.toFloat() / videoHeight.toFloat()
-        if (videoAspect > 1f) {
-            viewportWidth = outputWidth
-            viewportHeight = (outputWidth / videoAspect).toInt()
-            viewportX = 0
-            viewportY = (outputHeight - viewportHeight) / 2
+        if (fitMode == "fill") {
+            // Fill mode: crop to cover the entire square canvas (1:1)
+            if (videoAspect > 1f) {
+                viewportHeight = outputHeight
+                viewportWidth = (outputHeight * videoAspect).toInt()
+                viewportX = (outputWidth - viewportWidth) / 2
+                viewportY = 0
+            } else {
+                viewportWidth = outputWidth
+                viewportHeight = (outputWidth / videoAspect).toInt()
+                viewportX = 0
+                viewportY = (outputHeight - viewportHeight) / 2
+            }
         } else {
-            viewportHeight = outputHeight
-            viewportWidth = (outputHeight * videoAspect).toInt()
-            viewportY = 0
-            viewportX = (outputWidth - viewportWidth) / 2
+            // Default "fit" mode: letterbox / contain within canvas
+            if (videoAspect > 1f) {
+                viewportWidth = outputWidth
+                viewportHeight = (outputWidth / videoAspect).toInt()
+                viewportX = 0
+                viewportY = (outputHeight - viewportHeight) / 2
+            } else {
+                viewportHeight = outputHeight
+                viewportWidth = (outputHeight * videoAspect).toInt()
+                viewportY = 0
+                viewportX = (outputWidth - viewportWidth) / 2
+            }
         }
     }
 

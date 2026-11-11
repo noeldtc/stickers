@@ -32,11 +32,19 @@ class EditPage extends StatefulWidget {
   final StickerPack pack;
   final int index;
 
-  const EditPage(this.pack, this.index, this.imagePath, this.mediaType, {super.key});
+  final MediaType mediaType;
+  final String fitMode;
+
+  const EditPage(
+    this.pack,
+    this.index,
+    this.imagePath,
+    this.mediaType, {
+    this.fitMode = 'fit',
+    super.key,
+  });
 
   static const routeName = "/edit";
-
-  final MediaType mediaType;
 
   @override
   State<EditPage> createState() => _EditPageState();
@@ -613,7 +621,13 @@ class _EditPageState extends State<EditPage> {
         method: 4,
       );
       await service.start(
-          videoFile: _source.path, overlayFile: out.path, outputFile: output.path, config: config, fps: fps);
+        videoFile: _source.path,
+        overlayFile: out.path,
+        outputFile: output.path,
+        config: config,
+        fps: fps,
+        fitMode: widget.fitMode,
+      );
       await for (final update in service.progressStream) {
         if (update.status == Status.SUCCESS) {
           break;

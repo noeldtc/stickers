@@ -130,5 +130,10 @@
   "needsStaticPack": "C'est une image fixe : il faut un pack statique. Elle sera ajoutée à « {pack} ».",
   "convertingMedia": "Conversion de l'animation…",
   "unsupportedMedia": "Ce fichier n'est pas une image, un GIF ou une vidéo convertible en sticker.",
-  "conversionFailed": "Impossible de convertir l'animation"
+  "conversionFailed": "Impossible de convertir l'animation",
+  "fitMode": "Ajuster",
+  "fillMode": "Remplir 1:1",
+  "captureFrame": "Image fixe",
+  "captureFrameTooltip": "Capturer une image fixe comme sticker statique",
+  "configureSticker": "Configurer le sticker"
 }

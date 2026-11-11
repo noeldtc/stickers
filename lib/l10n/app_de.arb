@@ -130,5 +130,10 @@
     "needsStaticPack": "Das ist ein Standbild und braucht ein statisches Pack. Es wird zu „{pack}“ hinzugefügt.",
     "convertingMedia": "Animation wird konvertiert…",
     "unsupportedMedia": "Diese Datei ist kein Bild, GIF oder Video, das zu einem Sticker werden kann.",
-    "conversionFailed": "Animation konnte nicht konvertiert werden"
+    "conversionFailed": "Animation konnte nicht konvertiert werden",
+    "fitMode": "Einpassen",
+    "fillMode": "1:1 Füllen",
+    "captureFrame": "Standbild",
+    "captureFrameTooltip": "Standbild als statischen Sticker erfassen",
+    "configureSticker": "Sticker konfigurieren"
 }

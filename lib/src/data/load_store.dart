@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -145,8 +146,54 @@ Future<List<StickerPack>> getPacks() async {
   return List.empty(growable: true);
 }
 
+enum CropShape {
+  rectangle,
+  circle,
+  roundedRect,
+}
+
+/// Applies a shape mask (circle, rounded rectangle) to the given image bytes.
+Future<Uint8List> applyShapeMask(Uint8List imageBytes, CropShape shape, Size size) async {
+  if (shape == CropShape.rectangle) return imageBytes;
+
+  final codec = await ui.instantiateImageCodec(imageBytes);
+  final frame = await codec.getNextFrame();
+  final image = frame.image;
+
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder, Rect.fromLTWH(0, 0, size.width, size.height));
+  final rect = Rect.fromLTWH(0, 0, size.width, size.height);
+  final clipPath = Path();
+
+  if (shape == CropShape.circle) {
+    clipPath.addOval(rect);
+  } else if (shape == CropShape.roundedRect) {
+    clipPath.addRRect(RRect.fromRectAndRadius(rect, Radius.circular(rect.shortestSide * 0.18)));
+  }
+
+  canvas.clipPath(clipPath);
+  final paint = Paint()..isAntiAlias = true;
+  canvas.drawImageRect(
+    image,
+    Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+    rect,
+    paint,
+  );
+
+  final picture = recorder.endRecording();
+  final outputImage = await picture.toImage(size.width.toInt(), size.height.toInt());
+  final byteData = await outputImage.toByteData(format: ui.ImageByteFormat.png);
+
+  outputImage.dispose();
+  image.dispose();
+  codec.dispose();
+
+  return byteData!.buffer.asUint8List();
+}
+
 Future<Uint8List> cropSticker(
-    Rect cropRect, Uint8List rawImageData, StickerPack pack, int index, double rotation) async {
+    Rect cropRect, Uint8List rawImageData, StickerPack pack, int index, double rotation,
+    {CropShape shape = CropShape.rectangle}) async {
   // Apply crop then scale then put on 512x512 transparent image in center
 
   final crop = ImageEditorOption();
@@ -167,7 +214,12 @@ Future<Uint8List> cropSticker(
     ),
   );
   crop.outputFormat = const OutputFormat.png(); // Ensure the format supports transparency
-  final intermediate = (await ImageEditor.editImage(image: rawImageData, imageEditorOption: crop))!;
+  Uint8List intermediate = (await ImageEditor.editImage(image: rawImageData, imageEditorOption: crop))!;
+
+  // Apply shape mask if circular or rounded rectangle
+  if (shape != CropShape.rectangle) {
+    intermediate = await applyShapeMask(intermediate, shape, newSize);
+  }
 
   final option = ImageMergeOption(
     canvasSize: const Size.square(512),
